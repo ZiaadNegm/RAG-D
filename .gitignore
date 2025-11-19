@@ -1,23 +1,34 @@
-/experiments/
-/checkpoints/
-/data/
-/logs/
-/mlruns/
-/profiler/
-/logs/
+# Local experiments, models, logs (your runs)
+ /experiments/
+ /checkpoints/
+ /logs/
+ /mlruns/
+ /profiler/
 
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
+# Local data produced in this repo (we keep big stuff out of git)
+ /data/
 
-# Jupyter Notebook
-.ipynb_checkpoints
-# notebooks/
+# Python bytecode
+ __pycache__/
+ *.py[cod]
+ *$py.class
 
-# mac
-.DS_Store
+# Environments & secrets
+ .env
+ .venv/
+ venv/
 
-# Other
-.vscode
-*.tsv
+# Jupyter
+ .ipynb_checkpoints
+
+# OS/editor junk
+ .DS_Store
+ .vscode/
+ .idea/
+
+# Large tabular outputs you don't want in git by default
+ # Limit to local data & experiments rather than global *.tsv
+ /data/**/*.tsv
+ /experiments/**/*.tsv
+ /experiments/**/*.csv
+ /experiments/**/*.jsonl
