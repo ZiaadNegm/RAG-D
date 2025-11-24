@@ -1,0 +1,12 @@
+$schema: https://azuremlschemas.azureedge.net/latest/data.schema.json
+
+name: msmarco_plaid_index_nbits2
+description: ColBERT v2 PLAID index (nbits=2) for MS MARCO Passage v1
+type: uri_folder
+
+# This is the path ON THE VM
+path: /mnt/RAG-D/experiments/msmarco_passage/indexes/msmarco_passage.nbits2
+
+# Existing datastore where your raw MSMARCO also lives
+datastore: msmarco_ds
+

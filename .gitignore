@@ -32,3 +32,9 @@
  /experiments/**/*.tsv
  /experiments/**/*.csv
  /experiments/**/*.jsonl
+#
+# Local logs
+index.log
+rsync.log
+*.log
+
