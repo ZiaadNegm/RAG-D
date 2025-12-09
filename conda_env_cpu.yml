@@ -21,7 +21,7 @@ dependencies:
     - flask
     - python-dotenv
     - onnxruntime
-    - onnxruntime_tools
+    - onnx
     - coremltools
     - beir
     - tabulate

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 import torch
 from transformers import AutoTokenizer
-import openvino.runtime as ov
+import openvino as ov
 from optimum.intel.openvino import OVModelForSeq2SeqLM
 from huggingface_hub import hf_hub_download
 

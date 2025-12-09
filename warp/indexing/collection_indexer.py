@@ -6,7 +6,8 @@ import torch
 import random
 try:
     import faiss
-except ImportError as e:
+except ImportError:
+    faiss = None
     print("WARNING: faiss must be imported for indexing")
 
 import numpy as np
