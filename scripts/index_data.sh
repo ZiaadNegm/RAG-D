@@ -20,6 +20,9 @@ echo "Activating conda environment 'warp'..."
 source $(conda info --base)/etc/profile.d/conda.sh
 conda activate warp
 
+# Fix: Use conda's libstdc++ (has CXXABI_1.3.15 required by faiss-gpu)
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+
 echo "Using Python: $(which python)"
 echo "Index root: ${INDEX_ROOT}"
 echo ""

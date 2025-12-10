@@ -15,7 +15,7 @@ def parse_warp_run_config(collection, dataset, type_, split, nbits):
     if collection == "lotte" and type_ is None:
         return None
     return WARPRunConfig(
-        nranks=4,
+        nranks=1,
         collection=collection,
         dataset=dataset,
         type_=type_,
