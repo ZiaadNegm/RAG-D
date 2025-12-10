@@ -65,6 +65,7 @@ class WARPSearcher:
         results = WARPRankingItems()
         for qid, qtext in tqdm(queries, disable=not show_progress):
             tracker.next_iteration()
+            tracker.record("query_id", qid)
             results += WARPRankingItem(
                 qid=qid, results=self.search(qtext, k=k, tracker=tracker)
             )

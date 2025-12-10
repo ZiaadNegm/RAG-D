@@ -184,6 +184,8 @@ class IndexScorerWARP(IndexLoaderWARP):
 
             tracker.begin("top-k Precompute")
             Q_mask = Q.squeeze(0).count_nonzero(dim=1) != 0
+            query_tokens = Q_mask.sum().item()
+            tracker.record("query_length", query_tokens)
             cells, centroid_scores, mse_estimates = self._warp_select_centroids(
                 Q_mask, centroid_scores, self.nprobe, self.t_prime[k]
             )
@@ -208,6 +210,7 @@ class IndexScorerWARP(IndexLoaderWARP):
             Q_mask, centroid_scores, self.sizes_compacted, nprobe, t_prime, self.bound
         )
 
+        # TODO: Find out the clusters touched and note their centroid ID. Then store this in a list called clusters_selected. Then take the len(clusters_selected) and store as n_clusters_selected
         cells = cells.flatten().contiguous()
         scores = scores.flatten().contiguous()
 

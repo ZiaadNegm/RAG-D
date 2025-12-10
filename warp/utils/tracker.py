@@ -1,7 +1,8 @@
 import time
 import matplotlib.pyplot as plt
 import pandas as pd
-
+from enum import Enum
+from dataclasses import dataclass
 
 class ExecutionTrackerIteration:
     def __init__(self, tracker):
@@ -13,13 +14,66 @@ class ExecutionTrackerIteration:
     def __exit__(self, exception_type, exception_value, exception_traceback):
         self._tracker.end_iteration()
 
+class Logging_Mode(Enum):
+    "Ranging from most detailed to least detailed. Determines what 'special' metrics are logged"
+    A = "A"
+    B = "B"
+    C = "C"
+
+@dataclass
+class MetricsA:
+        query_id = None
+        dataset = None
+        query_length = None
+        n_clusters_selected = None
+        unique_docs = None
+        total_token_scores = None
+        difficulty = None
+
+@dataclass
+class MetricsB:
+    MetricsA
+    doc_id = None
+    score_full = None
+    score_centroid_only = None
+    num_influential_tokens = None
+
+@dataclass
+class MetricsC:
+    MetricsB
+    token_position = None
+    cluster_id = None
+    centroid_contribution = None
+    residual_contribution = None
+    is_max_for_doc = None
+
+A_Logging_Metrics = {}
+class SpecialMetrics:
+    def __init__(self, mode: Logging_Mode):
+        self.mode = mode
+        self._current = {}
+        self._all_iterations = []
+
+    def record(self, name, value):
+        self._current[name] = value
+
+    def next_iteration(self):
+        self._current = {}
+    
+    def end_iteration(self):
+        self._all_iterations.append(self._current.copy())
+
+    def summary(self):
+        print(self.end_iteration)
+
 class ExecutionTracker:
-    def __init__(self, name, steps):
+    def __init__(self, name, steps, mode=Logging_Mode.A):
         self._name = name
         self._steps = steps
         self._num_iterations = 0
         self._time = None
         self._time_per_step = {}
+        self.specialMetrics = SpecialMetrics(mode)
         for step in steps:
             self._time_per_step[step] = 0
         self._iter_begin = None
@@ -30,6 +84,7 @@ class ExecutionTracker:
         self._iterating = True
         self._current_steps = []
         self._iter_begin = time.time()
+        self.specialMetrics.next_iteration()
 
     def end_iteration(self):
         tok = time.time()
@@ -38,6 +93,8 @@ class ExecutionTracker:
         assert self._steps == self._current_steps
         self._iterating = False
         self._iter_time += tok - self._iter_begin
+        self.specialMetrics.end_iteration()
+        # TODO: Save metrics_per_query: Write to file? -> Clean the set entries
 
     def iteration(self):
         return ExecutionTrackerIteration(self)
@@ -53,6 +110,8 @@ class ExecutionTracker:
         self._time_per_step[name] += tok - self._time
         self._time = None
 
+    # TODO: Lets add a finalize so we know when to write away the Set of "Metrics overall"
+
     def summary(self, steps=None):
         if steps is None:
             steps = self._steps
@@ -60,7 +119,11 @@ class ExecutionTracker:
         breakdown = [
             (step, self._time_per_step[step] / self._num_iterations) for step in steps
         ]
+        self.specialMetrics.summary()
         return iteration_time, breakdown
+
+    def record(self, name, value):
+        self.specialMetrics.record(name, value)
 
     def as_dict(self):
         return {
@@ -133,6 +196,9 @@ class NOPTracker:
 
     def summary(self):
         raise AssertionError
+
+    def record(self, name, value):
+        pass  # NOP
 
     def display(self):
         raise AssertionError
