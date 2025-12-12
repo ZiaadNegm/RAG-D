@@ -150,7 +150,7 @@ std::vector<int> partial_sort_results(annotated_stride_view<> stride,
     return pid_idx;
 }
 
-std::tuple<torch::Tensor, torch::Tensor> merge_candidate_scores(
+std::tuple<torch::Tensor, torch::Tensor, int> merge_candidate_scores(
         const torch::Tensor candidate_capacities,
         const torch::Tensor candidate_sizes,
         const torch::Tensor candidate_pids_strided,
@@ -191,7 +191,9 @@ std::tuple<torch::Tensor, torch::Tensor> merge_candidate_scores(
     merge_candidates_tokens(views, views_buffer, nprobe, mse_estimates.data_ptr<float>());
 
     // NOTE After all merges have occured the stride at index 0 contains the resulting scores.
-    const int num_results = std::min(*(views[0].size_), k);
+    // Capture unique docs count before filtering to top-k
+    const int unique_docs_touched = *(views[0].size_);
+    const int num_results = std::min(unique_docs_touched, k);
     std::vector<int> pid_idx = partial_sort_results(views[0], num_results);
 
     torch::Tensor candidate_pids = torch::zeros({num_results}, torch::kInt32);
@@ -208,7 +210,7 @@ std::tuple<torch::Tensor, torch::Tensor> merge_candidate_scores(
         candidate_scores_ptr[i] = scores_ptr[idx];
     }
 
-    return {std::move(candidate_pids), std::move(candidate_scores)};
+    return {std::move(candidate_pids), std::move(candidate_scores), unique_docs_touched};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

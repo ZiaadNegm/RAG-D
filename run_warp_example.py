@@ -52,7 +52,7 @@ def main():
     queries = WARPQueries(config)
     
     # Limit to first 5 queries for testing
-    NUM_TEST_QUERIES = 5
+    NUM_TEST_QUERIES = 1
     queries.queries.data = dict(list(queries.queries.data.items())[:NUM_TEST_QUERIES])
     
     # Setup execution tracking

@@ -189,6 +189,10 @@ class IndexScorerWARP(IndexLoaderWARP):
             cells, centroid_scores, mse_estimates = self._warp_select_centroids(
                 Q_mask, centroid_scores, self.nprobe, self.t_prime[k]
             )
+            # Count non-zero cells (total centroid lookups, including duplicates)
+            # Count unique centroids actually selected
+            n_clusters_selected = torch.unique(cells[cells != 0]).numel()
+            tracker.record("n_clusters_selected", n_clusters_selected)
             tracker.end("top-k Precompute")
 
             tracker.begin("Decompression")
@@ -198,9 +202,10 @@ class IndexScorerWARP(IndexLoaderWARP):
             tracker.end("Decompression")
 
             tracker.begin("Build Matrix")
-            pids, scores = self._merge_candidate_scores(
+            pids, scores, unique_docs = self._merge_candidate_scores(
                 capacities, candidate_sizes, candidate_pids, candidate_scores, mse_estimates, k
             )
+            tracker.record("unique_docs", unique_docs)
             tracker.end("Build Matrix")
 
             return pids, scores
@@ -210,7 +215,9 @@ class IndexScorerWARP(IndexLoaderWARP):
             Q_mask, centroid_scores, self.sizes_compacted, nprobe, t_prime, self.bound
         )
 
-        # TODO: Find out the clusters touched and note their centroid ID. Then store this in a list called clusters_selected. Then take the len(clusters_selected) and store as n_clusters_selected
+        # TODO: Find out the clusters touched and note their centroid ID. 
+        # Then store this in a list called clusters_selected.
+        # Then take the len(clusters_selected) and store as n_clusters_selected
         cells = cells.flatten().contiguous()
         scores = scores.flatten().contiguous()
 
@@ -237,7 +244,7 @@ class IndexScorerWARP(IndexLoaderWARP):
     def _merge_candidate_scores(
         self, capacities, candidate_sizes, candidate_pids, candidate_scores, mse_estimates, k
     ):
-        pids, scores = IndexScorerWARP.merge_candidate_scores_cpp(
+        pids, scores, unique_docs = IndexScorerWARP.merge_candidate_scores_cpp(
             capacities, candidate_sizes, candidate_pids, candidate_scores, mse_estimates, self.nprobe, k
         )
-        return pids.tolist(), scores.tolist()
+        return pids.tolist(), scores.tolist(), unique_docs

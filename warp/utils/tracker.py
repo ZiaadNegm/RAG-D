@@ -49,6 +49,8 @@ class MetricsC:
 
 A_Logging_Metrics = {}
 class SpecialMetrics:
+    # TODO: For n_clusters_selected, we should change this into a percentage
+    #  of how many centroids vs what was supposed to be touched
     def __init__(self, mode: Logging_Mode):
         self.mode = mode
         self._current = {}
