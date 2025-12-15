@@ -8,23 +8,37 @@ Usage:
 """
 
 import os
+import sys
 # WARP's search engine is CPU-only; hide GPUs to force CPU mode
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+# Configure threading environment BEFORE importing torch
+NUM_THREADS = 1  # Adjust based on your CPU cores (you have 16)
+
+os.environ["MKL_NUM_THREADS"] = str(NUM_THREADS)
+os.environ["NUMEXPR_NUM_THREADS"] = str(NUM_THREADS)
+os.environ["OMP_NUM_THREADS"] = str(NUM_THREADS)
+os.environ["OPENBLAS_NUM_THREADS"] = str(NUM_THREADS)
+os.environ["VECLIB_MAXIMUM_THREADS"] = str(NUM_THREADS)
+
+# Prevent thread oversubscription
+os.environ["OMP_WAIT_POLICY"] = "PASSIVE"
+os.environ["KMP_AFFINITY"] = "disabled"
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
 load_dotenv()
 
 import torch
-# WARP's search engine is CPU-optimized; set to 1 thread for single-threaded mode
-torch.set_num_threads(1)
+# WARP's search engine is CPU-optimized; use multiple threads for parallel execution
+torch.set_num_threads(NUM_THREADS)
 
 from warp.engine.config import WARPRunConfig
 from warp.engine.searcher import WARPSearcher
 from warp.data.queries import WARPQueries
 from warp.utils.tracker import ExecutionTracker
 
-def main():
+def main(num_queries_to_run: int):
     # Configure the run
     config = WARPRunConfig(
         collection="beir",
@@ -52,15 +66,14 @@ def main():
     queries = WARPQueries(config)
     
     # Limit to first 5 queries for testing
-    NUM_TEST_QUERIES = 1
-    queries.queries.data = dict(list(queries.queries.data.items())[:NUM_TEST_QUERIES])
+    queries.queries.data = dict(list(queries.queries.data.items())[:num_queries_to_run])
     
     # Setup execution tracking
     steps = ["Query Encoding", "Candidate Generation", "top-k Precompute", "Decompression", "Build Matrix"]
     tracker = ExecutionTracker(name="XTR/WARP", steps=steps)
     
     # Run search on all queries
-    print(f"\nRunning search on {len(queries)} queries (limited to {NUM_TEST_QUERIES} for testing)...")
+    print(f"\nRunning search on {len(queries)} queries (limited to {num_queries_to_run} for testing)...")
     rankings = searcher.search_all(queries, k=config.k, batched=False, tracker=tracker, show_progress=True)
     
     # Evaluate results
@@ -84,4 +97,5 @@ def main():
         print(f"  Query {i+1}: {metrics}")
 
 if __name__ == "__main__":
-    main()
+    num_queries_to_run = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+    main(num_queries_to_run)

@@ -95,6 +95,12 @@ class IndexScorer(IndexLoader, CandidateGeneration):
                 pids = torch.tensor(pids, dtype=pids_.dtype, device=pids_.device)
             tracker.end("Candidate Generation")
 
+            # Record metrics for analysis
+            Q_mask = Q.squeeze(0).count_nonzero(dim=1) != 0
+            query_tokens = Q_mask.sum().item()
+            tracker.record("query_length", query_tokens)
+            tracker.record("unique_docs", len(pids))
+
             if filter_fn is not None:
                 filtered_pids = filter_fn(pids)
                 assert isinstance(filtered_pids, torch.Tensor), type(filtered_pids)

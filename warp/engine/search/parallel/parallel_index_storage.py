@@ -214,9 +214,14 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
 
             tracker.begin("top-k Precompute")
             Q_mask = Q.squeeze(0).count_nonzero(dim=1) != 0
+            query_tokens = Q_mask.sum().item()
+            tracker.record("query_length", query_tokens)
             cells, centroid_scores, mse_estimates = self._warp_select_centroids(
                 Q_mask, centroid_scores, self.nprobe, self.t_prime[k]
             )
+            # Count unique centroids actually selected
+            n_clusters_selected = torch.unique(cells[cells != self.kdummy_centroid]).numel()
+            tracker.record("n_clusters_selected", n_clusters_selected)
             tracker.end("top-k Precompute")
 
             num_tokens = Q_mask.sum().item()
@@ -225,17 +230,24 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
                 tracker.end("Decompression")
 
                 tracker.begin("Build Matrix")
-                pids, scores = self._fused_decompress_merge_scores(
+                pids, scores, unique_docs, total_token_scores = self._fused_decompress_merge_scores(
                     Q.squeeze(0), cells, centroid_scores, self.nprobe, num_tokens, mse_estimates, k
                 )
+                tracker.record("total_token_scores", total_token_scores)
+                tracker.record("unique_docs", unique_docs)
                 tracker.end("Build Matrix")
             else:
                 tracker.begin("Decompression")
                 capacities, candidate_sizes, candidate_pids, candidate_scores = self._decompress_centroids(
                     Q.squeeze(0), cells, centroid_scores, self.nprobe, num_tokens
                 )
+                # Total token-document similarity evaluations
+                total_token_scores = capacities.sum().item()
+                tracker.record("total_token_scores", total_token_scores)
+                # Count unique documents before merge/truncation
+                unique_docs = torch.unique(candidate_pids[candidate_pids >= 0]).numel()
+                tracker.record("unique_docs", unique_docs)
                 tracker.end("Decompression")
-
                 tracker.begin("Build Matrix")
                 pids, scores = self._merge_candidate_scores(
                     capacities, candidate_sizes, candidate_pids, candidate_scores, mse_estimates, k, num_tokens
@@ -288,9 +300,10 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
         ends = self.offsets_compacted[centroid_ids + 1]
 
         capacities = ends - begins
-        pids, scores = ParallelIndexScorerWARP.fused_decompress_merge_cpp[self.nbits](
+        total_token_scores = capacities.sum().item()
+        pids, scores, unique_docs = ParallelIndexScorerWARP.fused_decompress_merge_cpp[self.nbits](
             begins, ends, capacities, centroid_scores, self.codes_compacted,
             self.residuals_compacted, self.bucket_weights, Q, nprobe, num_tokens,
             mse_estimates, k
         )
-        return pids.tolist(), scores.tolist()
+        return pids.tolist(), scores.tolist(), unique_docs, total_token_scores

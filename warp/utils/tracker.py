@@ -1,4 +1,5 @@
 import time
+import threading
 import matplotlib.pyplot as plt
 import pandas as pd
 from enum import Enum
@@ -53,17 +54,21 @@ class SpecialMetrics:
     #  of how many centroids vs what was supposed to be touched
     def __init__(self, mode: Logging_Mode):
         self.mode = mode
+        self._lock = threading.Lock()
         self._current = {}
         self._all_iterations = []
 
     def record(self, name, value):
-        self._current[name] = value
+        with self._lock:
+            self._current[name] = value
 
     def next_iteration(self):
-        self._current = {}
+        with self._lock:
+            self._current = {}
     
     def end_iteration(self):
-        self._all_iterations.append(self._current.copy())
+        with self._lock:
+            self._all_iterations.append(self._current.copy())
 
     def summary(self):
         print(self.end_iteration)
@@ -134,6 +139,7 @@ class ExecutionTracker:
             "time_per_step": self._time_per_step,
             "num_iterations": self._num_iterations,
             "iteration_time": self._iter_time,
+            "special_metrics": self.specialMetrics._all_iterations,
         }
 
     @staticmethod
@@ -142,6 +148,8 @@ class ExecutionTracker:
         tracker._time_per_step = data["time_per_step"]
         tracker._num_iterations = data["num_iterations"]
         tracker._iter_time = data["iteration_time"]
+        if "special_metrics" in data:
+            tracker.specialMetrics._all_iterations = data["special_metrics"]
         return tracker
 
     def __getitem__(self, key):
@@ -204,3 +212,32 @@ class NOPTracker:
 
     def display(self):
         raise AssertionError
+
+
+def aggregate_trackers(tracker_dicts):
+    """
+    Aggregate multiple serialized tracker instances into a single tracker.
+    
+    Args:
+        tracker_dicts: List of dictionaries from ExecutionTracker.as_dict()
+    
+    Returns:
+        ExecutionTracker: A merged tracker with combined timing and metrics
+    """
+    if not tracker_dicts:
+        raise ValueError("Cannot aggregate empty list of trackers")
+    
+    # Use the first tracker as a base
+    merged = ExecutionTracker.from_dict(tracker_dicts[0])
+    
+    # Merge remaining trackers
+    for t in tracker_dicts[1:]:
+        for step in merged._steps:
+            if step in t["time_per_step"]:
+                merged._time_per_step[step] += t["time_per_step"][step]
+        merged._num_iterations += t["num_iterations"]
+        merged._iter_time += t["iteration_time"]
+        if "special_metrics" in t:
+            merged.specialMetrics._all_iterations.extend(t["special_metrics"])
+    
+    return merged

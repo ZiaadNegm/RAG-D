@@ -308,7 +308,7 @@ struct fused_decompression_merge_task {
 
 // Input: capacities, candidate_sizes, candidate_pids, candidate_scores, mse_estimates, k
 template<int8_t nbits>
-std::tuple<torch::Tensor, torch::Tensor> parallel_fused_decompress_merge(
+std::tuple<torch::Tensor, torch::Tensor, int> parallel_fused_decompress_merge(
         const torch::Tensor begins,
         const torch::Tensor ends,
         const torch::Tensor candidate_capacities,
@@ -484,6 +484,7 @@ std::tuple<torch::Tensor, torch::Tensor> parallel_fused_decompress_merge(
     graph.run_all_tasks(num_threads);
 
     // NOTE After all merges have occured the stride at index 0 contains the resulting scores.
+    const int unique_docs_touched = *(views[0].size_);
     const int num_results = std::min(*(views[0].size_), k);
     std::vector<int> pid_idx = partial_sort_results(views[0], num_results);
 
@@ -493,6 +494,8 @@ std::tuple<torch::Tensor, torch::Tensor> parallel_fused_decompress_merge(
     const int32_t *pids_ptr = views[0].keys_;
     const float *scores_ptr = views[0].data_;
 
+
+
     int32_t *candidate_pids_ptr = candidate_pids.data_ptr<int32_t>();
     float *candidate_scores_ptr = candidate_scores.data_ptr<float>();
     for (int i = 0; i < num_results; ++i) {
@@ -501,7 +504,7 @@ std::tuple<torch::Tensor, torch::Tensor> parallel_fused_decompress_merge(
         candidate_scores_ptr[i] = scores_ptr[idx];
     }
     
-    return {std::move(candidate_pids), std::move(candidate_scores)};
+    return {std::move(candidate_pids), std::move(candidate_scores), unique_docs_touched};
 }
 
 
