@@ -189,6 +189,8 @@ class IndexScorerWARP(IndexLoaderWARP):
             cells, centroid_scores, mse_estimates = self._warp_select_centroids(
                 Q_mask, centroid_scores, self.nprobe, self.t_prime[k]
             )
+            non_zero_centroid_scores = centroid_scores[centroid_scores != 0]
+            tracker.record("centroid_scores", non_zero_centroid_scores)
             # Count non-zero cells (total centroid lookups, including duplicates)
             # Count unique centroids actually selected
             n_clusters_selected = torch.unique(cells[cells != 0]).numel()
