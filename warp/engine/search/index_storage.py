@@ -84,6 +84,7 @@ class IndexScorerWARP(IndexLoaderWARP):
         load_index_with_mmap=False,
         t_prime=None,
         bound=128,
+        centroid_only=False,
     ):
         assert not use_gpu
         assert not load_index_with_mmap
@@ -112,6 +113,7 @@ class IndexScorerWARP(IndexLoaderWARP):
         self.nbits = config.nbits
 
         self.bound = bound or 128
+        self.centroid_only = centroid_only
 
     @classmethod
     def try_load_torch_extensions(cls, use_gpu):
@@ -189,8 +191,8 @@ class IndexScorerWARP(IndexLoaderWARP):
             cells, centroid_scores, mse_estimates = self._warp_select_centroids(
                 Q_mask, centroid_scores, self.nprobe, self.t_prime[k]
             )
-            non_zero_centroid_scores = centroid_scores[centroid_scores != 0]
-            tracker.record("centroid_scores", non_zero_centroid_scores)
+            # non_zero_centroid_scores = centroid_scores[centroid_scores != 0]
+            # tracker.record("centroid_scores", non_zero_centroid_scores)
             # Count non-zero cells (total centroid lookups, including duplicates)
             # Count unique centroids actually selected
             n_clusters_selected = torch.unique(cells[cells != 0]).numel()
@@ -239,7 +241,7 @@ class IndexScorerWARP(IndexLoaderWARP):
         capacities = ends - begins
         sizes, pids, scores = IndexScorerWARP.decompress_centroids_cpp[self.nbits](
             begins, ends, capacities, centroid_scores, self.codes_compacted,
-            self.residuals_compacted, self.bucket_weights, Q, nprobe
+            self.residuals_compacted, self.bucket_weights, Q, nprobe, self.centroid_only
         )
         return capacities, sizes, pids, scores
 

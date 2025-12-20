@@ -70,7 +70,8 @@ torch_annotated_stride_view<> decompress_centroids(
     const torch::Tensor residuals_compacted,
     const torch::Tensor bucket_weights,
     const torch::Tensor Q,
-    const int nprobe) {
+    const int nprobe,
+    const bool centroid_only) {
   torch::NoGradGuard no_grad;
   torch::InferenceMode guard;
   static_assert(nbits == 2 || nbits == 4);
@@ -120,9 +121,9 @@ torch_annotated_stride_view<> decompress_centroids(
       const uint8_t *residual = residuals_ptr + (
         static_cast<int64_t>(begin + inner_idx) << packed_dim_shift
       );
-      const float score = centroid_score + decompression_kernel<nbits>(
-        residual, bucket_scores_ptr
-      );
+      const float score = centroid_only 
+        ? centroid_score 
+        : centroid_score + decompression_kernel<nbits>(residual, bucket_scores_ptr);
       // NOTE directly perform deduplication/max-reduction within the cluster.
       if (prev_pid != pid || score > prev_score) {
         pos += (prev_pid != pid);

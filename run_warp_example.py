@@ -50,6 +50,7 @@ def main(num_queries_to_run: int):
         k=100,              # Top-k documents to retrieve
         bound=128,          # Max tokens per document
         runtime=None,       # Use default PyTorch (or set to ONNX config)
+        centroid_only=False
     )
     
     print(f"Index path: {config.index_root}/{config.index_name}")

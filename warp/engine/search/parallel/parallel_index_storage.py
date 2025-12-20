@@ -86,7 +86,8 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
         load_index_with_mmap=False,
         t_prime=None,
         bound=128,
-        fused_decompression_merge=True
+        fused_decompression_merge=True,
+        centroid_only=False,
     ):
         assert not use_gpu
         assert not load_index_with_mmap
@@ -117,6 +118,8 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
 
         assert config.nbits in [2, 4]
         self.nbits = config.nbits
+
+        self.centroid_only = centroid_only
 
         self.centroid_idx = torch.stack(tuple([
             torch.arange(num_centroids, dtype=torch.int32) for _ in range(num_threads)
@@ -280,7 +283,7 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
         capacities = ends - begins
         sizes, pids, scores = ParallelIndexScorerWARP.decompress_centroids_cpp[self.nbits](
             begins, ends, capacities, centroid_scores, self.codes_compacted,
-            self.residuals_compacted, self.bucket_weights, Q, nprobe, num_tokens
+            self.residuals_compacted, self.bucket_weights, Q, nprobe, num_tokens, self.centroid_only
         )
         return capacities, sizes, pids, scores
 
@@ -304,6 +307,6 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
         pids, scores, unique_docs = ParallelIndexScorerWARP.fused_decompress_merge_cpp[self.nbits](
             begins, ends, capacities, centroid_scores, self.codes_compacted,
             self.residuals_compacted, self.bucket_weights, Q, nprobe, num_tokens,
-            mse_estimates, k
+            mse_estimates, k, self.centroid_only
         )
         return pids.tolist(), scores.tolist(), unique_docs, total_token_scores

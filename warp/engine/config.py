@@ -32,6 +32,11 @@ class WARPRunConfig:
     # NOTE This option is only applicable with num_threads != 1
     fused_ext: bool = True
 
+    # Use centroid-only scoring (skip residual decompression).
+    # When True, document scores are based only on centroid scores.
+    # When False (default), scores include centroid + residual decompression.
+    centroid_only: bool = False
+
     # NOTE To be more efficient, we could also derive this from the dataset.
     #      For now we just set it to a sufficiently high constant value.
     bound: int = 128

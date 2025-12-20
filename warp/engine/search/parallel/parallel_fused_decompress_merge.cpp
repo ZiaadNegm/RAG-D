@@ -144,6 +144,7 @@ struct decompression_context {
     const int32_t *codes_ptr;
     const uint8_t *residuals_ptr;
     const int nprobe;
+    const bool centroid_only;
     std::vector<annotated_stride_view<>> *views; // = data
 };
 
@@ -241,9 +242,9 @@ void decompress_centroid_stride(const decompression_context &context,
         const uint8_t *residual = context.residuals_ptr + (
             static_cast<int64_t>(begin + inner_idx) << packed_dim_shift
         );
-        const float score = centroid_score + decompression_kernel<nbits>(
-            residual, bucket_scores_ptr
-        );
+        const float score = context.centroid_only 
+            ? centroid_score 
+            : centroid_score + decompression_kernel<nbits>(residual, bucket_scores_ptr);
         // NOTE directly perform deduplication/max-reduction within the cluster.
         if (prev_pid != pid || score > prev_score) {
             pos += (prev_pid != pid);
@@ -320,7 +321,8 @@ std::tuple<torch::Tensor, torch::Tensor, int> parallel_fused_decompress_merge(
         const int nprobe,
         const int32_t num_query_tokens,
         const torch::Tensor mse_estimates,
-        const int k) {
+        const int k,
+        const bool centroid_only) {
     using warp::task_graph;
     using warp::task_ref;
 
@@ -383,6 +385,7 @@ std::tuple<torch::Tensor, torch::Tensor, int> parallel_fused_decompress_merge(
         .codes_ptr = codes_ptr,
         .residuals_ptr = residuals_ptr,
         .nprobe = nprobe,
+        .centroid_only = centroid_only,
         .views = &views
     };
     merge_context mcontext = {

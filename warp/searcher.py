@@ -75,11 +75,11 @@ class Searcher:
         if warp_engine:
             if torch.get_num_threads() == 1:
                 self.ranker = IndexScorerWARP(
-                    self.index, self.config, use_gpu, load_index_with_mmap, t_prime=warp_config.t_prime, bound=warp_config.bound
+                    self.index, self.config, use_gpu, load_index_with_mmap, t_prime=warp_config.t_prime, bound=warp_config.bound, centroid_only=warp_config.centroid_only
                 )
             else:
                 self.ranker = ParallelIndexScorerWARP(
-                    self.index, self.config, use_gpu, load_index_with_mmap, t_prime=warp_config.t_prime, bound=warp_config.bound, fused_decompression_merge=warp_config.fused_ext
+                    self.index, self.config, use_gpu, load_index_with_mmap, t_prime=warp_config.t_prime, bound=warp_config.bound, fused_decompression_merge=warp_config.fused_ext, centroid_only=warp_config.centroid_only
                 )
         else:
             self.ranker = IndexScorer(self.index, use_gpu, load_index_with_mmap)
