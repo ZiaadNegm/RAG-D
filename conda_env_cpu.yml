@@ -1,10 +1,11 @@
-name: colbert
+name: warp
 channels:
   - pytorch
   - conda-forge
   - defaults
 dependencies:
   - python=3.8
+  - gxx
   - faiss-cpu
   - pip=21.0
   - pytorch-cpu=1.13
@@ -19,3 +20,13 @@ dependencies:
     - ujson
     - flask
     - python-dotenv
+    - onnxruntime
+    - onnx
+    - coremltools
+    - beir
+    - tabulate
+    - openvino
+    - matplotlib
+    - jsonlines
+    - optimum
+    - optimum-intel
