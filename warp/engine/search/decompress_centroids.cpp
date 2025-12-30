@@ -139,7 +139,101 @@ torch_annotated_stride_view<> decompress_centroids(
   return {stride_sizes, pids, scores};
 }
 
+// Variant that also tracks winning embedding positions for M3 measurement
+// Returns: (stride_sizes, pids, scores, winner_positions)
+template<int8_t nbits>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> decompress_centroids_with_winners(
+    const torch::Tensor begins,
+    const torch::Tensor ends,
+    const torch::Tensor sizes,
+    const torch::Tensor centroid_scores,
+    const torch::Tensor codes_compacted,
+    const torch::Tensor residuals_compacted,
+    const torch::Tensor bucket_weights,
+    const torch::Tensor Q,
+    const int nprobe,
+    const bool centroid_only) {
+  torch::NoGradGuard no_grad;
+  torch::InferenceMode guard;
+  static_assert(nbits == 2 || nbits == 4);
+  constexpr int packed_vals_per_byte = 8 / nbits;
+  constexpr int packed_dim = dim / packed_vals_per_byte;
+  constexpr uint8_t bucket_dim_shift = nbits;
+
+  const int ncells = begins.size(0);
+  const int64_t *begins_ptr = begins.data_ptr<int64_t>();
+  const int64_t *sizes_ptr = sizes.data_ptr<int64_t>();
+  const float *centroids_ptr = centroid_scores.data_ptr<float>();
+
+  const int32_t *codes_ptr = codes_compacted.data_ptr<int32_t>();
+  const uint8_t *residuals_ptr = residuals_compacted.data_ptr<uint8_t>();
+
+  const int64_t numel = sizes.sum().item<int64_t>();
+  torch::Tensor stride_sizes = torch::zeros({ncells}, torch::kInt32);
+  torch::Tensor pids = torch::zeros({numel}, torch::kInt32);
+  torch::Tensor scores = torch::zeros({numel}, torch::kFloat32);
+  torch::Tensor winner_pos = torch::zeros({numel}, torch::kInt64);  // Track winning embedding positions
+
+  std::vector<annotated_stride_view<>> views = strided_view_with_winners(
+    sizes, stride_sizes, pids, scores, winner_pos
+  );
+
+  // NOTE Perform a single matrix-vector multiplication for the entire decompression.
+  const auto vt_bucket_scores = torch::matmul(
+    Q.unsqueeze(2), bucket_weights.unsqueeze(0)
+  );
+  const float *vt_bucket_scores_ptr = vt_bucket_scores.data_ptr<float>();
+  
+  // NOTE This is equivalent to log2(packed_dim) as packed_dim is a power of 2.
+  constexpr uint8_t packed_dim_shift = __builtin_ctz(packed_dim);
+  constexpr int bucket_score_offset = 128 * (1 << nbits);
+  for (int cell_idx = 0; cell_idx < ncells; ++cell_idx) {
+    const int64_t begin = begins_ptr[cell_idx];
+    const int n = sizes_ptr[cell_idx];
+
+    const float centroid_score = centroids_ptr[cell_idx];
+    const float *bucket_scores_ptr = vt_bucket_scores_ptr + (
+      (cell_idx / nprobe) * bucket_score_offset
+    );
+
+    const auto view = views[cell_idx];
+    int32_t pos = -1, prev_pid = -1; 
+    float prev_score = 0;
+    int64_t prev_winner_pos = -1;
+    
+    for (int inner_idx = 0; inner_idx < n; ++inner_idx) {
+      const int32_t pid = codes_ptr[begin + inner_idx];
+      const int64_t embedding_pos = begin + inner_idx;  // Global embedding position
+      const uint8_t *residual = residuals_ptr + (
+        embedding_pos << packed_dim_shift
+      );
+      const float score = centroid_only 
+        ? centroid_score 
+        : centroid_score + decompression_kernel<nbits>(residual, bucket_scores_ptr);
+      
+      // NOTE directly perform deduplication/max-reduction within the cluster.
+      // Track the winning embedding position alongside the winning score.
+      if (prev_pid != pid || score > prev_score) {
+        pos += (prev_pid != pid);
+        view.keys_[pos] = pid;
+        view.data_[pos] = score;
+        view.winner_pos_[pos] = embedding_pos;  // Track winner position
+        prev_pid = pid;
+        prev_score = score;
+        prev_winner_pos = embedding_pos;
+      }
+    }
+    *view.size_ = pos + (prev_pid != -1);
+  }
+
+  return {stride_sizes, pids, scores, winner_pos};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("decompress_centroids_2_cpp", &decompress_centroids<2>, "Decompress Centroid Embeddings (nbits=2)");
   m.def("decompress_centroids_4_cpp", &decompress_centroids<4>, "Decompress Centroid Embeddings (nbits=4)");
+  m.def("decompress_centroids_with_winners_2_cpp", &decompress_centroids_with_winners<2>, 
+        "Decompress Centroid Embeddings with Winner Tracking (nbits=2)");
+  m.def("decompress_centroids_with_winners_4_cpp", &decompress_centroids_with_winners<4>, 
+        "Decompress Centroid Embeddings with Winner Tracking (nbits=4)");
 }

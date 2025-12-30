@@ -122,8 +122,11 @@ class MeasurementCollector:
         # M3 Tier A: Docs touched per query token (for future use)
         self._m3a_buffer: List[Dict[str, Any]] = []
         
+        # M3 Tier B: Per-token winners for top-k documents
+        self._m3b_buffer: List[Dict[str, Any]] = []
+        
         # Track flush counts for debugging
-        self._flush_counts = {"m1": 0, "r0": 0, "m3a": 0}
+        self._flush_counts = {"m1": 0, "r0": 0, "m3a": 0, "m3b": 0}
         
         # Setup directories
         if create_dirs:
@@ -222,6 +225,86 @@ class MeasurementCollector:
         self._m1_buffer = []
     
     # -------------------------------------------------------------------------
+    # M3 Tier B: Per-token winners for top-k documents
+    # -------------------------------------------------------------------------
+    
+    def record_m3b_winner(
+        self,
+        query_id: int,
+        q_token_id: int,
+        doc_id: int,
+        winner_embedding_pos: int,
+        winner_score: float
+    ) -> None:
+        """
+        Record M3 Tier B metric: observed winner for a (query_token, doc) pair.
+        
+        M3 Tier B tracks which embedding position won the MaxSim reduction
+        for each (query_token, doc) pair in the top-k results.
+        
+        Args:
+            query_id: Query identifier
+            q_token_id: Query token position (0-31)
+            doc_id: Document identifier
+            winner_embedding_pos: Global position in codes_compacted of the winning embedding
+            winner_score: The MaxSim score for this (token, doc) pair
+        
+        Schema matches MEASUREMENT_WISHES.MD M3_observed_winners.parquet:
+            - query_id: int32
+            - q_token_id: int8
+            - doc_id: int32
+            - winner_embedding_pos: int64
+            - winner_score: float32
+        """
+        # Convert query_id to int if it's a string (BEIR dataset uses string IDs)
+        if isinstance(query_id, str):
+            query_id = int(query_id)
+        
+        with self._lock:
+            self._m3b_buffer.append({
+                "query_id": query_id,
+                "q_token_id": q_token_id,
+                "doc_id": doc_id,
+                "winner_embedding_pos": winner_embedding_pos,
+                "winner_score": winner_score
+            })
+            
+            if len(self._m3b_buffer) >= self.BUFFER_FLUSH_THRESHOLD:
+                self._flush_m3b_buffer()
+    
+    def _flush_m3b_buffer(self) -> None:
+        """
+        Write M3 Tier B buffer to Parquet file and clear buffer.
+        """
+        if not self._m3b_buffer:
+            return
+        
+        # Define schema for type consistency
+        schema = pa.schema([
+            ("query_id", pa.int32()),
+            ("q_token_id", pa.int8()),
+            ("doc_id", pa.int32()),
+            ("winner_embedding_pos", pa.int64()),
+            ("winner_score", pa.float32())
+        ])
+        
+        # Convert to PyArrow table
+        table = pa.Table.from_pylist(self._m3b_buffer, schema=schema)
+        
+        # Write to parquet in tier_b directory (append if file exists)
+        parquet_path = self.tier_b_dir / "M3_observed_winners.parquet"
+        
+        if parquet_path.exists():
+            # Read existing and concatenate
+            existing = pq.read_table(parquet_path)
+            table = pa.concat_tables([existing, table])
+        
+        pq.write_table(table, parquet_path, compression='snappy')
+        
+        self._flush_counts["m3b"] += 1
+        self._m3b_buffer = []
+    
+    # -------------------------------------------------------------------------
     # Metadata and finalization
     # -------------------------------------------------------------------------
     
@@ -290,6 +373,7 @@ class MeasurementCollector:
         """
         with self._lock:
             self._flush_m1_buffer()
+            self._flush_m3b_buffer()
             # Future: self._flush_r0_buffer(), self._flush_m3a_buffer()
         
         # Update metadata with completion status
@@ -309,7 +393,8 @@ class MeasurementCollector:
         return {
             "m1": len(self._m1_buffer),
             "r0": len(self._r0_buffer),
-            "m3a": len(self._m3a_buffer)
+            "m3a": len(self._m3a_buffer),
+            "m3b": len(self._m3b_buffer)
         }
     
     @property
@@ -327,6 +412,9 @@ class NOPMeasurementCollector:
     """
     
     def record_m1(self, query_id, q_token_id, centroid_id, num_token_token_sims):
+        pass
+    
+    def record_m3b_winner(self, query_id, q_token_id, doc_id, winner_embedding_pos, winner_score):
         pass
     
     def save_metadata(self, **kwargs):
@@ -427,11 +515,27 @@ class ExecutionTracker:
             )
         else:
             self._measurement_collector = NOPMeasurementCollector()
+        
+        # M3 Tier B tracking flag (disabled by default due to memory overhead)
+        self._m3_tracking_enabled = False
 
     @property
     def measurements_enabled(self) -> bool:
         """Check if measurement collection is enabled for this tracker."""
         return self._measurement_collector.is_enabled
+    
+    def enable_m3_tracking(self, enabled: bool = True) -> None:
+        """
+        Enable or disable M3 Tier B winner tracking.
+        
+        M3 Tier B tracks per-token winners for top-k documents. This has
+        additional memory overhead (~5.6 MB per query during processing)
+        and is disabled by default.
+        
+        Args:
+            enabled: Whether to enable M3 Tier B tracking
+        """
+        self._m3_tracking_enabled = enabled
     
     @property
     def measurement_collector(self):
@@ -531,6 +635,36 @@ class ExecutionTracker:
             q_token_id=q_token_id,
             centroid_id=centroid_id,
             num_token_token_sims=num_token_token_sims
+        )
+    
+    def record_m3_winner(
+        self,
+        q_token_id: int,
+        doc_id: int,
+        winner_embedding_pos: int,
+        winner_score: float,
+        query_id: Optional[int] = None
+    ):
+        """
+        Record M3 Tier B metric: observed winner for a (query_token, doc) pair.
+        
+        Args:
+            q_token_id: Query token position (0-31)
+            doc_id: Document identifier
+            winner_embedding_pos: Global position of the winning embedding
+            winner_score: The MaxSim score for this (token, doc) pair
+            query_id: Query ID (optional, uses current iteration's query_id if not provided)
+        """
+        qid = query_id if query_id is not None else self._current_query_id
+        if qid is None:
+            return
+        
+        self._measurement_collector.record_m3b_winner(
+            query_id=qid,
+            q_token_id=q_token_id,
+            doc_id=doc_id,
+            winner_embedding_pos=winner_embedding_pos,
+            winner_score=winner_score
         )
     
     def finalize_measurements(
@@ -683,6 +817,9 @@ class NOPTracker:
         pass
 
     def record_m1(self, q_token_id, centroid_id, num_token_token_sims, query_id=None):
+        pass
+    
+    def record_m3_winner(self, q_token_id, doc_id, winner_embedding_pos, winner_score, query_id=None):
         pass
     
     def finalize_measurements(self, **kwargs):

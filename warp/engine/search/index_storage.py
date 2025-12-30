@@ -144,6 +144,7 @@ class IndexScorerWARP(IndexLoaderWARP):
             f"Loading decompress_centroids_cpp extension (set WARP_LOAD_TORCH_EXTENSION_VERBOSE=True for more info)..."
         )
         cls.decompress_centroids_cpp = dict()
+        cls.decompress_centroids_with_winners_cpp = dict()  # NEW: winner tracking variants
         decompress_centroids_cpp = load(
             name="decompress_centroids_cpp",
             sources=[
@@ -157,11 +158,13 @@ class IndexScorerWARP(IndexLoaderWARP):
         )
         cls.decompress_centroids_cpp[2] = decompress_centroids_cpp.decompress_centroids_2_cpp
         cls.decompress_centroids_cpp[4] = decompress_centroids_cpp.decompress_centroids_4_cpp
+        cls.decompress_centroids_with_winners_cpp[2] = decompress_centroids_cpp.decompress_centroids_with_winners_2_cpp
+        cls.decompress_centroids_with_winners_cpp[4] = decompress_centroids_cpp.decompress_centroids_with_winners_4_cpp
 
         print_message(
             f"Loading merge_candidate_scores_cpp extension (set WARP_LOAD_TORCH_EXTENSION_VERBOSE=True for more info)..."
         )
-        cls.merge_candidate_scores_cpp = load(
+        merge_candidate_scores_module = load(
             name="merge_candidate_scores_cpp",
             sources=[
                 os.path.join(
@@ -171,7 +174,9 @@ class IndexScorerWARP(IndexLoaderWARP):
             ],
             extra_cflags=cflags,
             verbose=os.getenv("WARP_LOAD_TORCH_EXTENSION_VERBOSE", "False") == "True",
-        ).merge_candidate_scores_cpp
+        )
+        cls.merge_candidate_scores_cpp = merge_candidate_scores_module.merge_candidate_scores_cpp
+        cls.merge_candidate_scores_with_winners_cpp = merge_candidate_scores_module.merge_candidate_scores_with_winners_cpp
 
         cls.loaded_extensions = True
 
@@ -199,10 +204,22 @@ class IndexScorerWARP(IndexLoaderWARP):
             tracker.record("n_clusters_selected", n_clusters_selected)
             tracker.end("top-k Precompute")
 
+            # Decide whether to use winner-tracking path for M3 measurements
+            track_m3_winners = tracker.measurements_enabled and hasattr(tracker, '_m3_tracking_enabled') and tracker._m3_tracking_enabled
+            
             tracker.begin("Decompression")
-            capacities, candidate_sizes, candidate_pids, candidate_scores = self._decompress_centroids(
-                Q.squeeze(0), cells, centroid_scores, self.nprobe
-            )
+            if track_m3_winners:
+                # Use winner-tracking decompression for M3 Tier B
+                capacities, candidate_sizes, candidate_pids, candidate_scores, candidate_winners = self._decompress_centroids_with_winners(
+                    Q.squeeze(0), cells, centroid_scores, self.nprobe
+                )
+            else:
+                # Standard decompression
+                capacities, candidate_sizes, candidate_pids, candidate_scores = self._decompress_centroids(
+                    Q.squeeze(0), cells, centroid_scores, self.nprobe
+                )
+                candidate_winners = None
+            
             # Total token-document similarity evaluations (inner loop iterations in decompress)
             total_token_scores = capacities.sum().item()
             tracker.record("total_token_scores", total_token_scores)
@@ -225,9 +242,28 @@ class IndexScorerWARP(IndexLoaderWARP):
                             )
 
             tracker.begin("Build Matrix")
-            pids, scores, influential_counts, unique_docs = self._merge_candidate_scores(
-                capacities, candidate_sizes, candidate_pids, candidate_scores, mse_estimates, k
-            )
+            if track_m3_winners:
+                # Use winner-tracking merge for M3 Tier B
+                pids, scores, influential_counts, unique_docs, phase1_pids, phase1_scores, phase1_winners, phase1_sizes = self._merge_candidate_scores_with_winners(
+                    capacities, candidate_sizes, candidate_pids, candidate_scores, candidate_winners, mse_estimates, k
+                )
+                
+                # Record M3 Tier B: per-token winners for top-k documents
+                # Uses binary search to look up winners efficiently
+                self._record_m3_winners(
+                    tracker=tracker,
+                    top_k_pids=pids,
+                    phase1_pids=phase1_pids,
+                    phase1_scores=phase1_scores, 
+                    phase1_winners=phase1_winners,
+                    phase1_sizes=phase1_sizes,
+                    query_tokens=query_tokens
+                )
+            else:
+                pids, scores, influential_counts, unique_docs = self._merge_candidate_scores(
+                    capacities, candidate_sizes, candidate_pids, candidate_scores, mse_estimates, k
+                )
+            
             tracker.record("unique_docs", unique_docs)
             tracker.record("influential_counts", influential_counts)
             tracker.end("Build Matrix")
@@ -261,6 +297,21 @@ class IndexScorerWARP(IndexLoaderWARP):
             self.residuals_compacted, self.bucket_weights, Q, nprobe, self.centroid_only
         )
         return capacities, sizes, pids, scores
+    
+    def _decompress_centroids_with_winners(
+        self, Q, centroid_ids, centroid_scores, nprobe
+    ):
+        """Decompress with winner position tracking for M3 Tier B measurement."""
+        centroid_ids = centroid_ids.long()
+        begins = self.offsets_compacted[centroid_ids]
+        ends = self.offsets_compacted[centroid_ids + 1]
+
+        capacities = ends - begins
+        sizes, pids, scores, winners = IndexScorerWARP.decompress_centroids_with_winners_cpp[self.nbits](
+            begins, ends, capacities, centroid_scores, self.codes_compacted,
+            self.residuals_compacted, self.bucket_weights, Q, nprobe, self.centroid_only
+        )
+        return capacities, sizes, pids, scores, winners
 
     def _merge_candidate_scores(
         self, capacities, candidate_sizes, candidate_pids, candidate_scores, mse_estimates, k
@@ -269,3 +320,68 @@ class IndexScorerWARP(IndexLoaderWARP):
             capacities, candidate_sizes, candidate_pids, candidate_scores, mse_estimates, self.nprobe, k
         )
         return pids.tolist(), scores.tolist(), influential_counts.tolist(), unique_docs
+    
+    def _merge_candidate_scores_with_winners(
+        self, capacities, candidate_sizes, candidate_pids, candidate_scores, candidate_winners, mse_estimates, k
+    ):
+        """Merge with Phase 1 winner extraction for M3 Tier B measurement."""
+        result = IndexScorerWARP.merge_candidate_scores_with_winners_cpp(
+            capacities, candidate_sizes, candidate_pids, candidate_scores, candidate_winners, 
+            mse_estimates, self.nprobe, k
+        )
+        pids, scores, influential_counts, unique_docs = result[0], result[1], result[2], result[3]
+        phase1_pids, phase1_scores, phase1_winners, phase1_sizes = result[4], result[5], result[6], result[7]
+        
+        return (pids.tolist(), scores.tolist(), influential_counts.tolist(), unique_docs,
+                phase1_pids, phase1_scores, phase1_winners, phase1_sizes)
+    
+    def _record_m3_winners(
+        self, tracker, top_k_pids, phase1_pids, phase1_scores, phase1_winners, phase1_sizes, query_tokens
+    ):
+        """
+        Record M3 Tier B measurements: per-token winners for top-k documents.
+        
+        For each (query_token, doc) pair where doc is in top-k:
+        - Look up the winner in that token's Phase 1 stride via binary search
+        - Record (doc_id, winner_embedding_pos, winner_score)
+        
+        Args:
+            tracker: ExecutionTracker with measurement collector
+            top_k_pids: List of top-k document IDs (already sorted by score)
+            phase1_pids: List of 32 tensors, each containing doc_ids for that token
+            phase1_scores: List of 32 tensors, each containing scores for that token  
+            phase1_winners: List of 32 tensors, each containing winner positions for that token
+            phase1_sizes: Tensor of 32 integers, number of valid entries per token
+            query_tokens: Number of actual query tokens (not masked out)
+        """
+        if not hasattr(tracker, 'record_m3_winner'):
+            return
+            
+        # Convert top_k_pids to set for fast lookup
+        top_k_set = set(top_k_pids)
+        
+        for t in range(query_tokens):
+            size = phase1_sizes[t].item()
+            if size == 0:
+                continue
+                
+            # Get Phase 1 data for this token
+            pids_tensor = phase1_pids[t][:size]
+            scores_tensor = phase1_scores[t][:size]
+            winners_tensor = phase1_winners[t][:size]
+            
+            # Phase 1 strides are sorted by doc_id, so we can use binary search
+            # But it's simpler to iterate since size is typically ~1000-10000
+            pids_np = pids_tensor.numpy()
+            scores_np = scores_tensor.numpy()
+            winners_np = winners_tensor.numpy()
+            
+            for i in range(size):
+                doc_id = int(pids_np[i])
+                if doc_id in top_k_set:
+                    tracker.record_m3_winner(
+                        q_token_id=t,
+                        doc_id=doc_id,
+                        winner_embedding_pos=int(winners_np[i]),
+                        winner_score=float(scores_np[i])
+                    )
