@@ -157,6 +157,7 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
             f"Loading parallel_decompress_centroids_cpp extension (set WARP_LOAD_TORCH_EXTENSION_VERBOSE=True for more info)..."
         )
         cls.decompress_centroids_cpp = dict()
+        cls.decompress_centroids_with_winners_cpp = dict()  # NEW: winner tracking variants
         decompress_centroids_cpp = load(
             name="parallel_decompress_centroids_cpp",
             sources=[
@@ -170,11 +171,13 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
         )
         cls.decompress_centroids_cpp[2] = decompress_centroids_cpp.parallel_decompress_centroids_2_cpp
         cls.decompress_centroids_cpp[4] = decompress_centroids_cpp.parallel_decompress_centroids_4_cpp
+        cls.decompress_centroids_with_winners_cpp[2] = decompress_centroids_cpp.parallel_decompress_centroids_with_winners_2_cpp
+        cls.decompress_centroids_with_winners_cpp[4] = decompress_centroids_cpp.parallel_decompress_centroids_with_winners_4_cpp
 
         print_message(
             f"Loading parallel_merge_candidate_scores_cpp extension (set WARP_LOAD_TORCH_EXTENSION_VERBOSE=True for more info)..."
         )
-        cls.merge_candidate_scores_cpp = load(
+        merge_candidate_scores_module = load(
             name="parallel_merge_candidate_scores_cpp",
             sources=[
                 os.path.join(
@@ -184,7 +187,9 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
             ],
             extra_cflags=cflags,
             verbose=os.getenv("WARP_LOAD_TORCH_EXTENSION_VERBOSE", "False") == "True",
-        ).parallel_merge_candidate_scores_cpp
+        )
+        cls.merge_candidate_scores_cpp = merge_candidate_scores_module.parallel_merge_candidate_scores_cpp
+        cls.merge_candidate_scores_with_winners_cpp = merge_candidate_scores_module.parallel_merge_candidate_scores_with_winners_cpp
 
         print_message(
             f"Loading parallel_fused_decompress_merge extension (set WARP_LOAD_TORCH_EXTENSION_VERBOSE=True for more info)..."
@@ -228,7 +233,32 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
             tracker.end("top-k Precompute")
 
             num_tokens = Q_mask.sum().item()
-            if self.fused_decompression_merge:
+            
+            # M3 Measurement path: force non-fused mode for winner tracking
+            if tracker.measurements_enabled:
+                tracker.begin("Decompression")
+                capacities, candidate_sizes, candidate_pids, candidate_scores, candidate_winners = self._decompress_centroids_with_winners(
+                    Q.squeeze(0), cells, centroid_scores, self.nprobe, num_tokens
+                )
+                total_token_scores = capacities.sum().item()
+                tracker.record("total_token_scores", total_token_scores)
+                unique_docs = torch.unique(candidate_pids[candidate_pids >= 0]).numel()
+                tracker.record("unique_docs", unique_docs)
+                tracker.end("Decompression")
+                
+                tracker.begin("Build Matrix")
+                result = self._merge_candidate_scores_with_winners(
+                    capacities, candidate_sizes, candidate_pids, candidate_scores, candidate_winners,
+                    mse_estimates, k, num_tokens
+                )
+                pids, scores, influential_counts, unique_docs_final = result[0], result[1], result[2], result[3]
+                phase1_pids, phase1_scores, phase1_winners, phase1_sizes = result[4], result[5], result[6], result[7]
+                tracker.end("Build Matrix")
+                
+                # Record M3 winners for top-k documents
+                self._record_m3_winners(tracker, pids, phase1_pids, phase1_scores, phase1_winners, phase1_sizes, num_tokens)
+            
+            elif self.fused_decompression_merge:
                 tracker.begin("Decompression")
                 tracker.end("Decompression")
 
@@ -300,6 +330,36 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
         )
         return pids.tolist(), scores.tolist()
 
+    def _decompress_centroids_with_winners(
+        self, Q, centroid_ids, centroid_scores, nprobe, num_tokens
+    ):
+        """Decompress centroids with winner position tracking for M3."""
+        centroid_ids = centroid_ids.long()
+        begins = self.offsets_compacted[centroid_ids]
+        ends = self.offsets_compacted[centroid_ids + 1]
+
+        capacities = ends - begins
+        sizes, pids, scores, winners = ParallelIndexScorerWARP.decompress_centroids_with_winners_cpp[self.nbits](
+            begins, ends, capacities, centroid_scores, self.codes_compacted,
+            self.residuals_compacted, self.bucket_weights, Q, nprobe, num_tokens, self.centroid_only
+        )
+        return capacities, sizes, pids, scores, winners
+
+    def _merge_candidate_scores_with_winners(
+        self, capacities, candidate_sizes, candidate_pids, candidate_scores, candidate_winners, mse_estimates, k, num_tokens
+    ):
+        """Merge candidate scores with Phase 1 winner extraction for M3."""
+        result = ParallelIndexScorerWARP.merge_candidate_scores_with_winners_cpp(
+            capacities, candidate_sizes, candidate_pids, candidate_scores, candidate_winners,
+            mse_estimates, self.nprobe, k, num_tokens
+        )
+        # Returns: (pids, scores, influential_counts, unique_docs, 
+        #           phase1_pids[32], phase1_scores[32], phase1_winners[32], phase1_sizes)
+        pids, scores, influential_counts, unique_docs = result[0], result[1], result[2], result[3]
+        phase1_pids, phase1_scores, phase1_winners, phase1_sizes = result[4], result[5], result[6], result[7]
+        return (pids.tolist(), scores.tolist(), influential_counts, unique_docs,
+                phase1_pids, phase1_scores, phase1_winners, phase1_sizes)
+
     def _fused_decompress_merge_scores(
         self, Q, centroid_ids, centroid_scores, nprobe, num_tokens, mse_estimates, k
     ):
@@ -351,3 +411,51 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
                         centroid_id=centroid_id,
                         num_token_token_sims=num_sims
                     )
+
+    def _record_m3_winners(self, tracker, top_k_pids, phase1_pids, phase1_scores, phase1_winners, phase1_sizes, num_tokens):
+        """
+        Record M3 winners for top-k documents.
+        
+        For each top-k document, look up its winner in each token's Phase 1 stride
+        using binary search. Records (q_token_id, doc_id, winner_embedding_pos, winner_score).
+        
+        Args:
+            tracker: ExecutionTracker with measurements_enabled
+            top_k_pids: List of top-k document IDs
+            phase1_pids: List of 32 tensors, each containing doc IDs for that token
+            phase1_scores: List of 32 tensors, each containing scores for that token
+            phase1_winners: List of 32 tensors, each containing winner positions for that token
+            phase1_sizes: Tensor of sizes [32]
+            num_tokens: Number of actual query tokens
+        
+        See M3_INTEGRATION_PLAN.md for M3 Tier B specification.
+        """
+        if not tracker.measurements_enabled:
+            return
+        
+        import numpy as np
+        
+        phase1_sizes_np = phase1_sizes.numpy()
+        
+        for doc_id in top_k_pids:
+            for t in range(num_tokens):
+                size = phase1_sizes_np[t]
+                if size == 0:
+                    continue
+                
+                # Binary search for doc_id in this token's sorted stride
+                pids_np = phase1_pids[t].numpy()
+                idx = np.searchsorted(pids_np, doc_id)
+                
+                if idx < size and pids_np[idx] == doc_id:
+                    # Found: doc had observed evidence for this token
+                    winner_pos = phase1_winners[t][idx].item()
+                    winner_score = phase1_scores[t][idx].item()
+                    
+                    tracker.record_m3_winner(
+                        q_token_id=t,
+                        doc_id=doc_id,
+                        winner_embedding_pos=winner_pos,
+                        winner_score=winner_score
+                    )
+                # else: doc didn't have observed evidence for this token (MSE fallback)
