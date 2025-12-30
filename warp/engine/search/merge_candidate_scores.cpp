@@ -34,6 +34,40 @@ private:
     float lhs_mse_, rhs_mse_;
 };
 
+// NOTE Used to combine token-level scores into document-level scores WITH influential token counting.
+// A token is "influential" for a document if the doc has an observed score (not MSE fallback).
+struct reduce_sum_mse_combiner_with_counts {
+    reduce_sum_mse_combiner_with_counts(float lhs_mse, float rhs_mse)
+        : lhs_mse_(lhs_mse), rhs_mse_(rhs_mse) {}
+    
+    // Both sides have observed scores: sum scores and sum counts
+    float operator()(float lhs, float rhs) const noexcept {
+        return lhs + rhs;
+    }
+    int16_t combine_counts(int16_t lhs_count, int16_t rhs_count) const noexcept {
+        return lhs_count + rhs_count;
+    }
+    
+    // Only LHS has observed score: add MSE for RHS, keep LHS count
+    float lhs(float lhs) const noexcept {
+        return lhs + rhs_mse_;
+    }
+    int16_t lhs_count(int16_t lhs_count) const noexcept {
+        return lhs_count;  // RHS tokens used MSE fallback, not influential
+    }
+    
+    // Only RHS has observed score: add MSE for LHS, keep RHS count
+    float rhs(float rhs) const noexcept {
+        return lhs_mse_ + rhs;
+    }
+    int16_t rhs_count(int16_t rhs_count) const noexcept {
+        return rhs_count;  // LHS tokens used MSE fallback, not influential
+    }
+    
+private:
+    float lhs_mse_, rhs_mse_;
+};
+
 template<typename combiner_type>
 void merge_candidate_strides(const annotated_stride_view<> stride1,
                              const annotated_stride_view<> stride2,
@@ -77,6 +111,63 @@ void copy_candidate_stride(const annotated_stride_view<> source,
     *destination.size_ = size;
     memcpy(destination.keys_, source.keys_, size * sizeof(int32_t));
     memcpy(destination.data_, source.data_, size * sizeof(int32_t));
+}
+
+// Copy stride with counts for influential token tracking
+void copy_candidate_stride_with_counts(const annotated_stride_view<> source,
+                                       annotated_stride_view<> destination) {
+    const int32_t size = *source.size_;
+    *destination.size_ = size;
+    memcpy(destination.keys_, source.keys_, size * sizeof(int32_t));
+    memcpy(destination.data_, source.data_, size * sizeof(float));
+    memcpy(destination.counts_, source.counts_, size * sizeof(int16_t));
+}
+
+// Merge candidate strides with influential token count propagation
+void merge_candidate_strides_with_counts(
+        const annotated_stride_view<> stride1,
+        const annotated_stride_view<> stride2,
+        annotated_stride_view<> result,
+        reduce_sum_mse_combiner_with_counts combiner) {
+    const int32_t c1_size = *stride1.size_, c2_size = *stride2.size_;
+    int32_t result_size = 0, i1 = 0, i2 = 0;
+    while (i1 < c1_size && i2 < c2_size) {
+        const int32_t key1 = stride1.keys_[i1];
+        const int32_t key2 = stride2.keys_[i2];
+        result.keys_[result_size] = std::min(key1, key2);
+        if (key1 == key2) {
+            // Doc in both strides: sum scores and sum counts
+            result.data_[result_size] = combiner(stride1.data_[i1], stride2.data_[i2]);
+            result.counts_[result_size] = combiner.combine_counts(stride1.counts_[i1], stride2.counts_[i2]);
+            ++i1; ++i2;
+        } else if (key1 < key2) {
+            // Doc only in LHS: add MSE for RHS, keep LHS count
+            result.data_[result_size] = combiner.lhs(stride1.data_[i1]);
+            result.counts_[result_size] = combiner.lhs_count(stride1.counts_[i1]);
+            ++i1;
+        } else {
+            // Doc only in RHS: add MSE for LHS, keep RHS count
+            result.data_[result_size] = combiner.rhs(stride2.data_[i2]);
+            result.counts_[result_size] = combiner.rhs_count(stride2.counts_[i2]);
+            ++i2;
+        }
+        ++result_size;
+    }
+    // Drain remaining LHS
+    for (; i1 < c1_size; ++i1) {
+        result.keys_[result_size] = stride1.keys_[i1];
+        result.data_[result_size] = combiner.lhs(stride1.data_[i1]);
+        result.counts_[result_size] = combiner.lhs_count(stride1.counts_[i1]);
+        ++result_size;
+    }
+    // Drain remaining RHS
+    for (; i2 < c2_size; ++i2) {
+        result.keys_[result_size] = stride2.keys_[i2];
+        result.data_[result_size] = combiner.rhs(stride2.data_[i2]);
+        result.counts_[result_size] = combiner.rhs_count(stride2.counts_[i2]);
+        ++result_size;
+    }
+    *result.size_ = result_size;
 }
 
 // Merge the `nprobe` candidate lists associated with a specific token index.
@@ -135,6 +226,37 @@ void merge_candidates_tokens(std::vector<annotated_stride_view<>> &views,
     }
 }
 
+// Merge token-level scores into document-level scores WITH influential token counting.
+// Each doc starts with count=1 (present in that token's candidate list = influential for that token).
+// During merge, counts are summed when docs appear in both strides; preserved otherwise.
+void merge_candidates_tokens_with_counts(
+        std::vector<annotated_stride_view<>> &views,
+        std::vector<annotated_stride_view<>> &views_buffer,
+        const int nprobe, const float *mse_estimates) {
+    constexpr int num_tokens = 32;
+    std::array<float, num_tokens + 1> mse_prefix;
+    mse_prefix[0] = 0;
+    for (int i = 0; i < num_tokens; ++i) {
+        mse_prefix[i + 1] = mse_prefix[i] + mse_estimates[i];
+    }
+    for (int step_size = 1; step_size < num_tokens; step_size <<= 1) {
+        for (int lhs = 0; lhs < num_tokens; lhs += (step_size << 1)) {
+            const int rhs = lhs + step_size;
+            if (rhs < num_tokens) {
+                const float lhs_mse = mse_prefix[rhs] - mse_prefix[lhs];
+                const float rhs_mse = mse_prefix[std::min(rhs + step_size, num_tokens)] - mse_prefix[rhs];
+
+                reduce_sum_mse_combiner_with_counts combiner(lhs_mse, rhs_mse);
+                merge_candidate_strides_with_counts(views[lhs * nprobe], views[rhs * nprobe],
+                                                   views_buffer[lhs * nprobe], combiner);
+            } else {
+                copy_candidate_stride_with_counts(views[lhs * nprobe], views_buffer[lhs * nprobe]);
+            }
+        }
+        std::swap(views, views_buffer);
+    }
+}
+
 std::vector<int> partial_sort_results(annotated_stride_view<> stride,
                           const int num_results) {
     std::vector<int> pid_idx(*stride.size_);
@@ -150,7 +272,7 @@ std::vector<int> partial_sort_results(annotated_stride_view<> stride,
     return pid_idx;
 }
 
-std::tuple<torch::Tensor, torch::Tensor, int> merge_candidate_scores(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, int> merge_candidate_scores(
         const torch::Tensor candidate_capacities,
         const torch::Tensor candidate_sizes,
         const torch::Tensor candidate_pids_strided,
@@ -187,30 +309,59 @@ std::tuple<torch::Tensor, torch::Tensor, int> merge_candidate_scores(
         std::swap(views, views_buffer);
     }
 
-    // Finally merge the results *between* different tokens.
-    merge_candidates_tokens(views, views_buffer, nprobe, mse_estimates.data_ptr<float>());
+    // Initialize counts to 1 for each doc in each token's merged stride.
+    // A doc present in token i's stride has 1 influential token (token i).
+    torch::Tensor counts = torch::ones({num_candidates}, torch::kInt16);
+    torch::Tensor counts_buffer = torch::zeros({num_candidates}, torch::kInt16);
+
+    // Create views with counts for token-level merge
+    std::vector<annotated_stride_view<>> views_with_counts = strided_view_with_counts(
+        candidate_capacities, candidate_sizes,
+        candidate_pids_strided, candidate_scores_strided, counts
+    );
+    std::vector<annotated_stride_view<>> views_buffer_with_counts = strided_view_with_counts(
+        candidate_capacities, size_buffer, pid_buffer, score_buffer, counts_buffer
+    );
+
+    // Copy current merged data into views_with_counts (scores and pids are already there via shared tensors)
+    // But we need to sync sizes and repoint views to current data after nprobe merge
+    for (int token_idx = 0; token_idx < 32; ++token_idx) {
+        const int idx = token_idx * nprobe;
+        *views_with_counts[idx].size_ = *views[idx].size_;
+        // Copy pids and scores from views to views_with_counts (they share underlying tensors for pids/scores)
+        const int32_t size = *views[idx].size_;
+        memcpy(views_with_counts[idx].keys_, views[idx].keys_, size * sizeof(int32_t));
+        memcpy(views_with_counts[idx].data_, views[idx].data_, size * sizeof(float));
+    }
+
+    // Finally merge the results *between* different tokens WITH count tracking.
+    merge_candidates_tokens_with_counts(views_with_counts, views_buffer_with_counts, nprobe, mse_estimates.data_ptr<float>());
 
     // NOTE After all merges have occured the stride at index 0 contains the resulting scores.
     // Capture unique docs count before filtering to top-k
-    const int unique_docs_touched = *(views[0].size_);
+    const int unique_docs_touched = *(views_with_counts[0].size_);
     const int num_results = std::min(unique_docs_touched, k);
-    std::vector<int> pid_idx = partial_sort_results(views[0], num_results);
+    std::vector<int> pid_idx = partial_sort_results(views_with_counts[0], num_results);
 
     torch::Tensor candidate_pids = torch::zeros({num_results}, torch::kInt32);
     torch::Tensor candidate_scores = torch::zeros({num_results}, torch::kFloat32);
+    torch::Tensor influential_counts = torch::zeros({num_results}, torch::kInt16);
 
-    const int32_t *pids_ptr = views[0].keys_;
-    const float *scores_ptr = views[0].data_;
+    const int32_t *pids_ptr = views_with_counts[0].keys_;
+    const float *scores_ptr = views_with_counts[0].data_;
+    const int16_t *counts_ptr = views_with_counts[0].counts_;
 
     int32_t *candidate_pids_ptr = candidate_pids.data_ptr<int32_t>();
     float *candidate_scores_ptr = candidate_scores.data_ptr<float>();
+    int16_t *influential_counts_ptr = influential_counts.data_ptr<int16_t>();
     for (int i = 0; i < num_results; ++i) {
         const int idx = pid_idx[i];
         candidate_pids_ptr[i] = pids_ptr[idx];
         candidate_scores_ptr[i] = scores_ptr[idx];
+        influential_counts_ptr[i] = counts_ptr[idx];
     }
 
-    return {std::move(candidate_pids), std::move(candidate_scores), unique_docs_touched};
+    return {std::move(candidate_pids), std::move(candidate_scores), std::move(influential_counts), unique_docs_touched};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
