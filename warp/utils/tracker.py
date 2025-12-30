@@ -1,11 +1,21 @@
 import time
 import threading
+import json
+import os
+from pathlib import Path
+from datetime import datetime
+from enum import Enum
+from typing import Optional, Dict, List, Any, Union
+
 import matplotlib.pyplot as plt
 import pandas as pd
-from enum import Enum
-from dataclasses import dataclass
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 
 class ExecutionTrackerIteration:
+    """Context manager for tracking a single query iteration."""
+    
     def __init__(self, tracker):
         self._tracker = tracker
 
@@ -15,148 +25,586 @@ class ExecutionTrackerIteration:
     def __exit__(self, exception_type, exception_value, exception_traceback):
         self._tracker.end_iteration()
 
-class Logging_Mode(Enum):
-    "Ranging from most detailed to least detailed. Determines what 'special' metrics are logged"
-    A = "A"
-    B = "B"
-    C = "C"
 
-@dataclass
-class MetricsA:
-        query_id = None
-        dataset = None
-        query_length = None
-        n_clusters_selected = None
-        unique_docs = None
-        total_token_scores = None
-        difficulty = None
-
-@dataclass
-class MetricsB:
-    MetricsA
-    doc_id = None
-    score_full = None
-    score_centroid_only = None
-    num_influential_tokens = None
-
-@dataclass
-class MetricsC:
-    MetricsB
-    token_position = None
-    cluster_id = None
-    centroid_contribution = None
-    residual_contribution = None
-    is_max_for_doc = None
-
-A_Logging_Metrics = {}
-class SpecialMetrics:
-    # TODO: For n_clusters_selected, we should change this into a percentage
-    #  of how many centroids vs what was supposed to be touched
-    def __init__(self, mode: Logging_Mode):
-        self.mode = mode
-        self._lock = threading.Lock()
-        self._current = {}
-        self._all_iterations = []
-
-    def record(self, name, value):
-        with self._lock:
-            self._current[name] = value
-
-    def next_iteration(self):
-        with self._lock:
-            self._current = {}
+class MeasurementTier(Enum):
+    """
+    Measurement tiers as defined in MEASUREMENT_WISHES.MD.
     
-    def end_iteration(self):
-        with self._lock:
-            self._all_iterations.append(self._current.copy())
+    TIER_A: Small files collected for ALL queries (counters, routing info)
+    TIER_B: Large files for forensic analysis (winner identities, scores)
+    """
+    TIER_A = "tier_a"
+    TIER_B = "tier_b"
 
-    def summary(self):
-        print(self.end_iteration)
+
+class MeasurementCollector:
+    """
+    Collects SQ2 measurements and writes them to Parquet files.
+    
+    This class handles:
+    1. Directory structure setup (one-time, per run_id)
+    2. Buffering measurement data in memory
+    3. Flushing buffers to Parquet files when threshold is reached
+    4. Writing metadata.json with run configuration
+    
+    Directory structure created:
+        /mnt/warp_measurements/
+        └── runs/
+            └── {run_id}/
+                ├── metadata.json
+                ├── tier_a/
+                │   ├── R0_selected_centroids.parquet
+                │   ├── M1_compute_per_centroid.parquet
+                │   ├── M3_docs_touched.parquet
+                │   └── M6_missed_centroids_global.parquet
+                └── tier_b/
+                    ├── winners.parquet
+                    └── M6_per_query.parquet
+    
+    Usage:
+        collector = MeasurementCollector(
+            run_id="2024-12-30_quora_nprobe8",
+            output_dir="/mnt/warp_measurements"
+        )
+        
+        # During search loop
+        collector.record_m1(query_id=0, q_token_id=1, centroid_id=42, num_sims=1500)
+        
+        # At end of run
+        collector.save_metadata({...})
+        collector.flush_all()
+    
+    See MEASUREMENT_WISHES.MD for full specification.
+    """
+    
+    # Buffer flush threshold: flush to disk when buffer reaches this size.
+    # Set conservatively to avoid OOM during heavy WARP pipeline operations.
+    # With ~30 bytes per M1 row, 10K rows ≈ 300KB memory per buffer.
+    BUFFER_FLUSH_THRESHOLD = 10_000
+    
+    # Default output directory (can be overridden)
+    DEFAULT_OUTPUT_DIR = "/mnt/warp_measurements"
+    
+    def __init__(
+        self,
+        run_id: str,
+        output_dir: Optional[str] = None,
+        index_path: Optional[str] = None,
+        create_dirs: bool = True
+    ):
+        """
+        Initialize the measurement collector.
+        
+        Args:
+            run_id: Unique identifier for this run (e.g., "2024-12-30_quora_nprobe8")
+            output_dir: Base directory for measurements. Defaults to /mnt/warp_measurements
+            index_path: Path to the WARP index being used (for metadata)
+            create_dirs: If True, create directory structure immediately
+        """
+        self.run_id = run_id
+        self.output_dir = Path(output_dir or self.DEFAULT_OUTPUT_DIR)
+        self.index_path = index_path
+        self._lock = threading.Lock()
+        
+        # Paths
+        self.run_dir = self.output_dir / "runs" / run_id
+        self.tier_a_dir = self.run_dir / "tier_a"
+        self.tier_b_dir = self.run_dir / "tier_b"
+        self.metadata_path = self.run_dir / "metadata.json"
+        
+        # Buffers for each metric table
+        # M1: Total token-level computation per centroid
+        self._m1_buffer: List[Dict[str, Any]] = []
+        
+        # R0: Selected centroids per query token (for future use)
+        self._r0_buffer: List[Dict[str, Any]] = []
+        
+        # M3 Tier A: Docs touched per query token (for future use)
+        self._m3a_buffer: List[Dict[str, Any]] = []
+        
+        # Track flush counts for debugging
+        self._flush_counts = {"m1": 0, "r0": 0, "m3a": 0}
+        
+        # Setup directories
+        if create_dirs:
+            self._setup_directories()
+    
+    def _setup_directories(self) -> None:
+        """
+        Create the directory structure for this run.
+        
+        Creates:
+            - {output_dir}/runs/{run_id}/
+            - {output_dir}/runs/{run_id}/tier_a/
+            - {output_dir}/runs/{run_id}/tier_b/
+        
+        This is idempotent - safe to call multiple times.
+        """
+        self.tier_a_dir.mkdir(parents=True, exist_ok=True)
+        self.tier_b_dir.mkdir(parents=True, exist_ok=True)
+    
+    # -------------------------------------------------------------------------
+    # M1: Total token-level computation per centroid
+    # -------------------------------------------------------------------------
+    
+    def record_m1(
+        self,
+        query_id: int,
+        q_token_id: int,
+        centroid_id: int,
+        num_token_token_sims: int
+    ) -> None:
+        """
+        Record M1 metric: token-level computation for a specific centroid.
+        
+        M1 counts all evaluated token-token similarities s(q_i, d_j).
+        One unit = one computed similarity between a query token and a doc token.
+        
+        Args:
+            query_id: Query identifier (will be converted to int if string)
+            q_token_id: Query token position (0-31 typically)
+            centroid_id: The centroid whose embeddings were scored
+            num_token_token_sims: Number of similarities computed for this centroid
+                                  (equals the number of embeddings in the centroid)
+        
+        Schema matches MEASUREMENT_WISHES.MD M1_compute_per_centroid.parquet:
+            - query_id: int32
+            - q_token_id: int8
+            - centroid_id: int32
+            - num_token_token_sims: int32
+        """
+        # Convert query_id to int if it's a string (BEIR dataset uses string IDs)
+        if isinstance(query_id, str):
+            query_id = int(query_id)
+        
+        with self._lock:
+            self._m1_buffer.append({
+                "query_id": query_id,
+                "q_token_id": q_token_id,
+                "centroid_id": centroid_id,
+                "num_token_token_sims": num_token_token_sims
+            })
+            
+            if len(self._m1_buffer) >= self.BUFFER_FLUSH_THRESHOLD:
+                self._flush_m1_buffer()
+    
+    def _flush_m1_buffer(self) -> None:
+        """
+        Write M1 buffer to Parquet file and clear buffer.
+        
+        Uses PyArrow for efficient columnar storage with append support.
+        """
+        if not self._m1_buffer:
+            return
+        
+        # Define schema for type consistency
+        schema = pa.schema([
+            ("query_id", pa.int32()),
+            ("q_token_id", pa.int8()),
+            ("centroid_id", pa.int32()),
+            ("num_token_token_sims", pa.int32())
+        ])
+        
+        # Convert to PyArrow table
+        table = pa.Table.from_pylist(self._m1_buffer, schema=schema)
+        
+        # Write to parquet (append if file exists)
+        parquet_path = self.tier_a_dir / "M1_compute_per_centroid.parquet"
+        
+        if parquet_path.exists():
+            # Read existing and concatenate
+            existing = pq.read_table(parquet_path)
+            table = pa.concat_tables([existing, table])
+        
+        pq.write_table(table, parquet_path, compression='snappy')
+        
+        self._flush_counts["m1"] += 1
+        self._m1_buffer = []
+    
+    # -------------------------------------------------------------------------
+    # Metadata and finalization
+    # -------------------------------------------------------------------------
+    
+    def save_metadata(
+        self,
+        dataset_info: Optional[Dict[str, Any]] = None,
+        index_info: Optional[Dict[str, Any]] = None,
+        warp_config: Optional[Dict[str, Any]] = None,
+        candidate_doc_policy: Optional[Dict[str, Any]] = None,
+        git_commit: Optional[str] = None,
+        random_seed: Optional[int] = None,
+        extra: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Save run metadata to metadata.json.
+        
+        Schema follows MEASUREMENT_WISHES.MD specification.
+        
+        Args:
+            dataset_info: Dict with name, split, num_queries
+            index_info: Dict with path, num_centroids, num_embeddings, nbits
+            warp_config: Dict with n_probe, t_prime, centroid_only
+            candidate_doc_policy: Dict with type, k, sample_size
+            git_commit: Git commit hash for reproducibility
+            random_seed: Random seed used
+            extra: Any additional metadata to include
+        """
+        metadata = {
+            "run_id": self.run_id,
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "dataset": dataset_info or {},
+            "index": index_info or {"path": self.index_path},
+            "warp_config": warp_config or {},
+            "candidate_doc_policy": candidate_doc_policy or {
+                "type": "all_scored",
+                "k": None,
+                "sample_size": None
+            },
+            "reproducibility": {
+                "git_commit": git_commit,
+                "random_seed": random_seed
+            },
+            "storage": {
+                "tier_a_complete": False,  # Updated by flush_all()
+                "tier_b_complete": False,
+                "tier_b_query_subset": None,
+                "flush_counts": self._flush_counts.copy()
+            }
+        }
+        
+        if extra:
+            metadata.update(extra)
+        
+        with open(self.metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=4)
+    
+    def flush_all(self, tier_a_complete: bool = True, tier_b_complete: bool = False) -> None:
+        """
+        Flush all buffers and update metadata completion status.
+        
+        Call this at the end of a measurement run to ensure all data is written.
+        
+        Args:
+            tier_a_complete: Mark Tier A as complete in metadata
+            tier_b_complete: Mark Tier B as complete in metadata
+        """
+        with self._lock:
+            self._flush_m1_buffer()
+            # Future: self._flush_r0_buffer(), self._flush_m3a_buffer()
+        
+        # Update metadata with completion status
+        if self.metadata_path.exists():
+            with open(self.metadata_path, 'r') as f:
+                metadata = json.load(f)
+            
+            metadata["storage"]["tier_a_complete"] = tier_a_complete
+            metadata["storage"]["tier_b_complete"] = tier_b_complete
+            metadata["storage"]["flush_counts"] = self._flush_counts.copy()
+            
+            with open(self.metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=4)
+    
+    def get_buffer_sizes(self) -> Dict[str, int]:
+        """Return current buffer sizes for monitoring."""
+        return {
+            "m1": len(self._m1_buffer),
+            "r0": len(self._r0_buffer),
+            "m3a": len(self._m3a_buffer)
+        }
+    
+    @property
+    def is_enabled(self) -> bool:
+        """Check if measurement collection is enabled."""
+        return True  # Can be extended to support disabling
+
+
+class NOPMeasurementCollector:
+    """
+    No-operation measurement collector for when measurements are disabled.
+    
+    All methods are no-ops, allowing code to call measurement methods
+    without checking if collection is enabled.
+    """
+    
+    def record_m1(self, query_id, q_token_id, centroid_id, num_token_token_sims):
+        pass
+    
+    def save_metadata(self, **kwargs):
+        pass
+    
+    def flush_all(self, **kwargs):
+        pass
+    
+    def get_buffer_sizes(self):
+        return {}
+    
+    @property
+    def is_enabled(self):
+        return False
 
 class ExecutionTracker:
-    def __init__(self, name, steps, mode=Logging_Mode.A):
+    """
+    Tracks execution timing and optionally collects SQ2 measurements.
+    
+    This class serves two purposes:
+    1. Performance profiling: Measures time spent in each step of the pipeline
+    2. SQ2 measurements: Optionally collects metrics like M1 (token-level computation)
+    
+    The measurement collector is integrated here (rather than passed separately)
+    because ExecutionTracker is already instantiated in many places throughout
+    the codebase, reducing the risk of errors from missing collector arguments.
+    
+    Usage:
+        # Without measurements (default, backward compatible)
+        tracker = ExecutionTracker("WARP", steps=["Step1", "Step2"])
+        
+        # With measurements enabled
+        tracker = ExecutionTracker(
+            "WARP",
+            steps=["Step1", "Step2"],
+            measurement_run_id="2024-12-30_quora_nprobe8",
+            measurement_output_dir="/mnt/warp_measurements"
+        )
+        
+        with tracker.iteration():
+            tracker.begin("Step1")
+            # ... do work ...
+            tracker.record_m1(query_id=0, q_token_id=1, centroid_id=42, num_sims=1500)
+            tracker.end("Step1")
+        
+        # At end of run
+        tracker.finalize_measurements()
+    """
+    
+    def __init__(
+        self,
+        name: str,
+        steps: List[str],
+        measurement_run_id: Optional[str] = None,
+        measurement_output_dir: Optional[str] = None,
+        index_path: Optional[str] = None
+    ):
+        """
+        Initialize the execution tracker.
+        
+        Args:
+            name: Name of this tracker (e.g., "WARP", "XTR")
+            steps: List of step names that will be tracked (in order)
+            measurement_run_id: If provided, enables SQ2 measurement collection.
+                              Use a descriptive ID like "2024-12-30_quora_nprobe8"
+            measurement_output_dir: Base directory for measurements.
+                                   Defaults to /mnt/warp_measurements
+            index_path: Path to the WARP index (recorded in metadata)
+        """
         self._name = name
         self._steps = steps
         self._num_iterations = 0
         self._time = None
         self._time_per_step = {}
-        self.specialMetrics = SpecialMetrics(mode)
         for step in steps:
             self._time_per_step[step] = 0
         self._iter_begin = None
         self._iter_time = 0
+        self._iterating = False
+        self._current_steps = []
+        
+        # Current iteration's query_id (set via record("query_id", ...))
+        self._current_query_id: Optional[int] = None
+        
+        # Legacy in-memory metrics storage (for backward compatibility)
+        # TODO: Deprecate in favor of MeasurementCollector
+        self._legacy_metrics_current: Dict[str, Any] = {}
+        self._legacy_metrics_all: List[Dict[str, Any]] = []
+        self._legacy_lock = threading.Lock()
+        
+        # SQ2 Measurement collector (optional)
+        if measurement_run_id is not None:
+            self._measurement_collector = MeasurementCollector(
+                run_id=measurement_run_id,
+                output_dir=measurement_output_dir,
+                index_path=index_path,
+                create_dirs=True
+            )
+        else:
+            self._measurement_collector = NOPMeasurementCollector()
+
+    @property
+    def measurements_enabled(self) -> bool:
+        """Check if measurement collection is enabled for this tracker."""
+        return self._measurement_collector.is_enabled
+    
+    @property
+    def measurement_collector(self):
+        """Access the measurement collector directly (for advanced usage)."""
+        return self._measurement_collector
 
     def next_iteration(self):
+        """Start a new iteration (query)."""
         self._num_iterations += 1
         self._iterating = True
         self._current_steps = []
         self._iter_begin = time.time()
-        self.specialMetrics.next_iteration()
+        self._current_query_id = None
+        
+        # Legacy metrics
+        with self._legacy_lock:
+            self._legacy_metrics_current = {}
 
     def end_iteration(self):
+        """End the current iteration."""
         tok = time.time()
         if self._steps != self._current_steps:
-            print(self._steps, self._current_steps)
-        assert self._steps == self._current_steps
+            print(f"Warning: Expected steps {self._steps}, got {self._current_steps}")
+        assert self._steps == self._current_steps, f"Step mismatch: {self._steps} != {self._current_steps}"
         self._iterating = False
         self._iter_time += tok - self._iter_begin
-        self.specialMetrics.end_iteration()
-        # TODO: Save metrics_per_query: Write to file? -> Clean the set entries
+        
+        # Legacy metrics
+        with self._legacy_lock:
+            self._legacy_metrics_all.append(self._legacy_metrics_current.copy())
 
     def iteration(self):
+        """Context manager for iteration tracking."""
         return ExecutionTrackerIteration(self)
 
-    def begin(self, name):
-        assert self._time is None and self._iterating
+    def begin(self, name: str):
+        """Begin timing a step."""
+        assert self._time is None and self._iterating, f"Cannot begin '{name}' - not in iteration or previous step not ended"
         self._current_steps.append(name)
         self._time = time.time()
 
-    def end(self, name):
+    def end(self, name: str):
+        """End timing a step."""
         tok = time.time()
-        assert self._current_steps[-1] == name
+        assert self._current_steps[-1] == name, f"Step mismatch: ending '{name}' but current is '{self._current_steps[-1]}'"
         self._time_per_step[name] += tok - self._time
         self._time = None
 
-    # TODO: Lets add a finalize so we know when to write away the Set of "Metrics overall"
+    # -------------------------------------------------------------------------
+    # Legacy record method (backward compatible)
+    # -------------------------------------------------------------------------
+    
+    def record(self, name: str, value: Any):
+        """
+        Record a metric value (legacy interface).
+        
+        This stores metrics in memory for backward compatibility.
+        For SQ2 measurements, use the dedicated record_m1(), etc. methods.
+        
+        Special handling for 'query_id': stores it for use by measurement methods.
+        """
+        # Capture query_id for measurement methods
+        if name == "query_id":
+            self._current_query_id = value
+        
+        # Legacy in-memory storage
+        with self._legacy_lock:
+            self._legacy_metrics_current[name] = value
+    
+    # -------------------------------------------------------------------------
+    # SQ2 Measurement methods
+    # -------------------------------------------------------------------------
+    
+    def record_m1(
+        self,
+        q_token_id: int,
+        centroid_id: int,
+        num_token_token_sims: int,
+        query_id: Optional[int] = None
+    ):
+        """
+        Record M1 metric: token-level computation for a centroid.
+        
+        Args:
+            q_token_id: Query token position (0-31)
+            centroid_id: The centroid that was scored
+            num_token_token_sims: Number of embeddings scored in this centroid
+            query_id: Query ID (optional, uses current iteration's query_id if not provided)
+        """
+        qid = query_id if query_id is not None else self._current_query_id
+        if qid is None:
+            # Silently skip if no query_id (measurements may not be fully set up)
+            return
+        
+        self._measurement_collector.record_m1(
+            query_id=qid,
+            q_token_id=q_token_id,
+            centroid_id=centroid_id,
+            num_token_token_sims=num_token_token_sims
+        )
+    
+    def finalize_measurements(
+        self,
+        dataset_info: Optional[Dict[str, Any]] = None,
+        index_info: Optional[Dict[str, Any]] = None,
+        warp_config: Optional[Dict[str, Any]] = None,
+        **kwargs
+    ):
+        """
+        Finalize measurements: flush all buffers and save metadata.
+        
+        Call this at the end of a measurement run.
+        
+        Args:
+            dataset_info: Dict with name, split, num_queries
+            index_info: Dict with path, num_centroids, num_embeddings, nbits  
+            warp_config: Dict with n_probe, t_prime, centroid_only
+            **kwargs: Additional arguments passed to save_metadata
+        """
+        if not self.measurements_enabled:
+            return
+        
+        self._measurement_collector.save_metadata(
+            dataset_info=dataset_info,
+            index_info=index_info,
+            warp_config=warp_config,
+            **kwargs
+        )
+        self._measurement_collector.flush_all(tier_a_complete=True)
+
+    # -------------------------------------------------------------------------
+    # Summary and serialization
+    # -------------------------------------------------------------------------
 
     def summary(self, steps=None):
+        """Get timing summary."""
         if steps is None:
             steps = self._steps
         iteration_time = self._iter_time / self._num_iterations
         breakdown = [
             (step, self._time_per_step[step] / self._num_iterations) for step in steps
         ]
-        self.specialMetrics.summary()
         return iteration_time, breakdown
 
-    def record(self, name, value):
-        self.specialMetrics.record(name, value)
-
     def as_dict(self):
+        """Serialize tracker state to dictionary."""
         return {
             "name": self._name,
             "steps": self._steps,
             "time_per_step": self._time_per_step,
             "num_iterations": self._num_iterations,
             "iteration_time": self._iter_time,
-            "special_metrics": self.specialMetrics._all_iterations,
+            "special_metrics": self._legacy_metrics_all,  # Legacy name for compatibility
         }
 
     @staticmethod
     def from_dict(data):
+        """Deserialize tracker from dictionary."""
         tracker = ExecutionTracker(data["name"], data["steps"])
         tracker._time_per_step = data["time_per_step"]
         tracker._num_iterations = data["num_iterations"]
         tracker._iter_time = data["iteration_time"]
         if "special_metrics" in data:
-            tracker.specialMetrics._all_iterations = data["special_metrics"]
+            tracker._legacy_metrics_all = data["special_metrics"]
         return tracker
 
     def __getitem__(self, key):
+        """Get average time for a step."""
         assert key in self._steps
         return self._time_per_step[key] / self._num_iterations
 
     def display(self, steps=None, bound=None):
+        """Display timing breakdown as a bar chart."""
         iteration_time, breakdown = self.summary(steps)
         df = pd.DataFrame(
             {
@@ -189,29 +637,59 @@ class ExecutionTracker:
 
 
 class NOPTracker:
+    """
+    No-operation tracker for when timing/measurements are disabled.
+    
+    All methods are no-ops. Useful for production runs where tracking
+    overhead is not desired.
+    """
+    
     def __init__(self):
-        pass
+        self._measurement_collector = NOPMeasurementCollector()
+
+    @property
+    def measurements_enabled(self) -> bool:
+        return False
+    
+    @property  
+    def measurement_collector(self):
+        return self._measurement_collector
 
     def next_iteration(self):
         pass
 
     def begin(self, name):
-        pass  # NOP
+        pass
 
     def end(self, name):
-        pass  # NOP
+        pass
 
     def end_iteration(self):
         pass
 
+    def iteration(self):
+        return self  # Returns self as context manager
+    
+    def __enter__(self):
+        pass
+    
+    def __exit__(self, *args):
+        pass
+
     def summary(self):
-        raise AssertionError
+        raise AssertionError("NOPTracker does not support summary()")
 
     def record(self, name, value):
-        pass  # NOP
+        pass
+
+    def record_m1(self, q_token_id, centroid_id, num_token_token_sims, query_id=None):
+        pass
+    
+    def finalize_measurements(self, **kwargs):
+        pass
 
     def display(self):
-        raise AssertionError
+        raise AssertionError("NOPTracker does not support display()")
 
 
 def aggregate_trackers(tracker_dicts):
@@ -238,6 +716,6 @@ def aggregate_trackers(tracker_dicts):
         merged._num_iterations += t["num_iterations"]
         merged._iter_time += t["iteration_time"]
         if "special_metrics" in t:
-            merged.specialMetrics._all_iterations.extend(t["special_metrics"])
+            merged._legacy_metrics_all.extend(t["special_metrics"])
     
     return merged

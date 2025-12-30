@@ -257,6 +257,11 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
                 )
                 tracker.end("Build Matrix")
 
+            # M1 Measurement: Record token-level computation per centroid
+            # Uses helper function to avoid code duplication between fused/non-fused paths
+            # See MEASUREMENT_WISHES.MD and M1_INTEGRATION_PLAN.md
+            self._record_m1_measurements(tracker, cells, num_tokens)
+
             return pids, scores
 
     def _warp_select_centroids(self, Q_mask, centroid_scores, nprobe, t_prime):
@@ -310,3 +315,39 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
             mse_estimates, k, self.centroid_only
         )
         return pids.tolist(), scores.tolist(), unique_docs, total_token_scores
+
+    def _record_m1_measurements(self, tracker, cells, num_tokens):
+        """
+        Record M1 measurements for all query tokens.
+        
+        This helper computes capacities from offsets_compacted and records M1
+        metrics for each (query_token, centroid) pair. Thread-safe via the
+        MeasurementCollector's internal lock.
+        
+        Args:
+            tracker: ExecutionTracker with measurements_enabled
+            cells: Tensor of selected centroid IDs [32 * nprobe]
+            num_tokens: Number of actual query tokens (from Q_mask.sum())
+        
+        See MEASUREMENT_WISHES.MD for M1 specification.
+        """
+        if not tracker.measurements_enabled:
+            return
+        
+        # Compute capacities from offsets (same as in _fused_decompress_merge_scores)
+        centroid_ids = cells.long()
+        capacities = self.offsets_compacted[centroid_ids + 1] - self.offsets_compacted[centroid_ids]
+        
+        # Record M1 for each (query_token, centroid) pair
+        for t in range(num_tokens):
+            for p in range(self.nprobe):
+                idx = t * self.nprobe + p
+                centroid_id = cells[idx].item()
+                num_sims = capacities[idx].item()
+                # Skip dummy centroids (masked out tokens) and empty centroids
+                if centroid_id != self.kdummy_centroid and num_sims > 0:
+                    tracker.record_m1(
+                        q_token_id=t,
+                        centroid_id=centroid_id,
+                        num_token_token_sims=num_sims
+                    )

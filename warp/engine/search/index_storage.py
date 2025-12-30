@@ -208,11 +208,28 @@ class IndexScorerWARP(IndexLoaderWARP):
             tracker.record("total_token_scores", total_token_scores)
             tracker.end("Decompression")
 
+            # M1 Measurement: Record token-level computation per centroid
+            # See MEASUREMENT_WISHES.MD and M1_INTEGRATION_PLAN.md
+            if tracker.measurements_enabled:
+                for t in range(query_tokens):
+                    for p in range(self.nprobe):
+                        idx = t * self.nprobe + p
+                        centroid_id = cells[idx].item()
+                        num_sims = capacities[idx].item()
+                        # Skip dummy centroids (masked out tokens) and empty centroids
+                        if centroid_id != self.kdummy_centroid and num_sims > 0:
+                            tracker.record_m1(
+                                q_token_id=t,
+                                centroid_id=centroid_id,
+                                num_token_token_sims=num_sims
+                            )
+
             tracker.begin("Build Matrix")
-            pids, scores, unique_docs = self._merge_candidate_scores(
+            pids, scores, influential_counts, unique_docs = self._merge_candidate_scores(
                 capacities, candidate_sizes, candidate_pids, candidate_scores, mse_estimates, k
             )
             tracker.record("unique_docs", unique_docs)
+            tracker.record("influential_counts", influential_counts)
             tracker.end("Build Matrix")
 
             return pids, scores
@@ -248,7 +265,7 @@ class IndexScorerWARP(IndexLoaderWARP):
     def _merge_candidate_scores(
         self, capacities, candidate_sizes, candidate_pids, candidate_scores, mse_estimates, k
     ):
-        pids, scores, unique_docs = IndexScorerWARP.merge_candidate_scores_cpp(
+        pids, scores, influential_counts, unique_docs = IndexScorerWARP.merge_candidate_scores_cpp(
             capacities, candidate_sizes, candidate_pids, candidate_scores, mse_estimates, self.nprobe, k
         )
-        return pids.tolist(), scores.tolist(), unique_docs
+        return pids.tolist(), scores.tolist(), influential_counts.tolist(), unique_docs
