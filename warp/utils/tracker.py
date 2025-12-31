@@ -125,8 +125,11 @@ class MeasurementCollector:
         # M3 Tier B: Per-token winners for top-k documents
         self._m3b_buffer: List[Dict[str, Any]] = []
         
+        # M4: Oracle winners (all embeddings per doc, ignoring routing)
+        self._m4_buffer: List[Dict[str, Any]] = []
+        
         # Track flush counts for debugging
-        self._flush_counts = {"m1": 0, "r0": 0, "m3a": 0, "m3b": 0}
+        self._flush_counts = {"m1": 0, "r0": 0, "m3a": 0, "m3b": 0, "m4": 0}
         
         # Setup directories
         if create_dirs:
@@ -305,6 +308,146 @@ class MeasurementCollector:
         self._m3b_buffer = []
     
     # -------------------------------------------------------------------------
+    # R0: Selected centroids per query token (for M5 miss detection)
+    # -------------------------------------------------------------------------
+    
+    def record_r0_centroid(
+        self,
+        query_id: int,
+        q_token_id: int,
+        centroid_id: int,
+        rank: int
+    ) -> None:
+        """
+        Record R0 metric: selected centroid for a query token.
+        
+        R0 records which centroids were selected for each query token,
+        needed for M5 miss detection (comparing oracle winner's centroid
+        against selected centroids).
+        
+        Args:
+            query_id: Query identifier
+            q_token_id: Query token position (0-31)
+            centroid_id: The selected centroid ID
+            rank: Rank among nprobe selections (0 = best scoring)
+        
+        Schema for R0_selected_centroids.parquet:
+            - query_id: int32
+            - q_token_id: int8
+            - centroid_id: int32
+            - rank: int8
+        """
+        if isinstance(query_id, str):
+            query_id = int(query_id)
+        
+        with self._lock:
+            self._r0_buffer.append({
+                "query_id": query_id,
+                "q_token_id": q_token_id,
+                "centroid_id": centroid_id,
+                "rank": rank
+            })
+            
+            if len(self._r0_buffer) >= self.BUFFER_FLUSH_THRESHOLD:
+                self._flush_r0_buffer()
+    
+    def _flush_r0_buffer(self) -> None:
+        """Write R0 buffer to Parquet file and clear buffer."""
+        if not self._r0_buffer:
+            return
+        
+        schema = pa.schema([
+            ("query_id", pa.int32()),
+            ("q_token_id", pa.int8()),
+            ("centroid_id", pa.int32()),
+            ("rank", pa.int8())
+        ])
+        
+        table = pa.Table.from_pylist(self._r0_buffer, schema=schema)
+        parquet_path = self.tier_b_dir / "R0_selected_centroids.parquet"
+        
+        if parquet_path.exists():
+            existing = pq.read_table(parquet_path)
+            table = pa.concat_tables([existing, table])
+        
+        pq.write_table(table, parquet_path, compression='snappy')
+        
+        self._flush_counts["r0"] += 1
+        self._r0_buffer = []
+    
+    # -------------------------------------------------------------------------
+    # M4: Oracle winners (all embeddings per doc, ignoring routing)
+    # -------------------------------------------------------------------------
+    
+    def record_m4_winner(
+        self,
+        query_id: int,
+        q_token_id: int,
+        doc_id: int,
+        oracle_embedding_pos: int,
+        oracle_score: float
+    ) -> None:
+        """
+        Record M4 metric: oracle winner for a (query_token, doc) pair.
+        
+        M4 records which embedding would have been the MaxSim winner if
+        all document embeddings were considered (ignoring routing/nprobe).
+        
+        Args:
+            query_id: Query identifier
+            q_token_id: Query token position (0-31)
+            doc_id: Document identifier
+            oracle_embedding_pos: Global position of the oracle winning embedding
+            oracle_score: The oracle MaxSim score over ALL doc embeddings
+        
+        Schema for M4_oracle_winners.parquet:
+            - query_id: int32
+            - q_token_id: int8
+            - doc_id: int32
+            - oracle_embedding_pos: int64
+            - oracle_score: float32
+        """
+        if isinstance(query_id, str):
+            query_id = int(query_id)
+        
+        with self._lock:
+            self._m4_buffer.append({
+                "query_id": query_id,
+                "q_token_id": q_token_id,
+                "doc_id": doc_id,
+                "oracle_embedding_pos": oracle_embedding_pos,
+                "oracle_score": oracle_score
+            })
+            
+            if len(self._m4_buffer) >= self.BUFFER_FLUSH_THRESHOLD:
+                self._flush_m4_buffer()
+    
+    def _flush_m4_buffer(self) -> None:
+        """Write M4 buffer to Parquet file and clear buffer."""
+        if not self._m4_buffer:
+            return
+        
+        schema = pa.schema([
+            ("query_id", pa.int32()),
+            ("q_token_id", pa.int8()),
+            ("doc_id", pa.int32()),
+            ("oracle_embedding_pos", pa.int64()),
+            ("oracle_score", pa.float32())
+        ])
+        
+        table = pa.Table.from_pylist(self._m4_buffer, schema=schema)
+        parquet_path = self.tier_b_dir / "M4_oracle_winners.parquet"
+        
+        if parquet_path.exists():
+            existing = pq.read_table(parquet_path)
+            table = pa.concat_tables([existing, table])
+        
+        pq.write_table(table, parquet_path, compression='snappy')
+        
+        self._flush_counts["m4"] += 1
+        self._m4_buffer = []
+    
+    # -------------------------------------------------------------------------
     # Metadata and finalization
     # -------------------------------------------------------------------------
     
@@ -374,7 +517,8 @@ class MeasurementCollector:
         with self._lock:
             self._flush_m1_buffer()
             self._flush_m3b_buffer()
-            # Future: self._flush_r0_buffer(), self._flush_m3a_buffer()
+            self._flush_r0_buffer()
+            self._flush_m4_buffer()
         
         # Update metadata with completion status
         if self.metadata_path.exists():
@@ -394,7 +538,8 @@ class MeasurementCollector:
             "m1": len(self._m1_buffer),
             "r0": len(self._r0_buffer),
             "m3a": len(self._m3a_buffer),
-            "m3b": len(self._m3b_buffer)
+            "m3b": len(self._m3b_buffer),
+            "m4": len(self._m4_buffer)
         }
     
     @property
@@ -518,6 +663,9 @@ class ExecutionTracker:
         
         # M3 Tier B tracking flag (disabled by default due to memory overhead)
         self._m3_tracking_enabled = False
+        
+        # M4 Oracle tracking flag (disabled by default due to compute overhead)
+        self._m4_tracking_enabled = False
 
     @property
     def measurements_enabled(self) -> bool:
@@ -536,6 +684,25 @@ class ExecutionTracker:
             enabled: Whether to enable M3 Tier B tracking
         """
         self._m3_tracking_enabled = enabled
+    
+    def enable_m4_tracking(self, enabled: bool = True) -> None:
+        """
+        Enable or disable M4 Oracle winner tracking.
+        
+        M4 Oracle computes what the true MaxSim winner would be for each
+        (query_token, doc) pair if all doc embeddings were considered
+        (ignoring routing). This has significant compute overhead (~30-50ms
+        per query with C++ implementation) and is disabled by default.
+        
+        Args:
+            enabled: Whether to enable M4 Oracle tracking
+        """
+        self._m4_tracking_enabled = enabled
+    
+    @property
+    def m4_tracking_enabled(self) -> bool:
+        """Check if M4 Oracle tracking is enabled."""
+        return self._m4_tracking_enabled
     
     @property
     def measurement_collector(self):
@@ -667,6 +834,63 @@ class ExecutionTracker:
             winner_score=winner_score
         )
     
+    def record_r0_centroid(
+        self,
+        q_token_id: int,
+        centroid_id: int,
+        rank: int,
+        query_id: Optional[int] = None
+    ):
+        """
+        Record R0 metric: selected centroid for a query token.
+        
+        Args:
+            q_token_id: Query token position (0-31)
+            centroid_id: The selected centroid ID
+            rank: Rank among nprobe selections (0 = best scoring)
+            query_id: Query ID (optional, uses current iteration's query_id if not provided)
+        """
+        qid = query_id if query_id is not None else self._current_query_id
+        if qid is None:
+            return
+        
+        self._measurement_collector.record_r0_centroid(
+            query_id=qid,
+            q_token_id=q_token_id,
+            centroid_id=centroid_id,
+            rank=rank
+        )
+    
+    def record_m4_winner(
+        self,
+        q_token_id: int,
+        doc_id: int,
+        oracle_embedding_pos: int,
+        oracle_score: float,
+        query_id: Optional[int] = None
+    ):
+        """
+        Record M4 metric: oracle winner for a (query_token, doc) pair.
+        
+        Args:
+            q_token_id: Query token position (0-31)
+            doc_id: Document identifier
+            oracle_embedding_pos: Global position of the oracle winning embedding
+            oracle_score: The oracle MaxSim score over ALL doc embeddings
+            query_id: Query ID (optional, uses current iteration's query_id if not provided)
+        """
+        qid = query_id if query_id is not None else self._current_query_id
+        if qid is None:
+            return
+        
+        self._measurement_collector.record_m4_winner(
+            query_id=qid,
+            q_token_id=q_token_id,
+            doc_id=doc_id,
+            oracle_embedding_pos=oracle_embedding_pos,
+            oracle_score=oracle_score
+        )
+    
     def finalize_measurements(
         self,
         dataset_info: Optional[Dict[str, Any]] = None,
@@ -785,6 +1009,10 @@ class NOPTracker:
     def measurements_enabled(self) -> bool:
         return False
     
+    @property
+    def m4_tracking_enabled(self) -> bool:
+        return False
+    
     @property  
     def measurement_collector(self):
         return self._measurement_collector
@@ -820,6 +1048,12 @@ class NOPTracker:
         pass
     
     def record_m3_winner(self, q_token_id, doc_id, winner_embedding_pos, winner_score, query_id=None):
+        pass
+    
+    def record_r0_centroid(self, q_token_id, centroid_id, rank, query_id=None):
+        pass
+    
+    def record_m4_winner(self, q_token_id, doc_id, oracle_embedding_pos, oracle_score, query_id=None):
         pass
     
     def finalize_measurements(self, **kwargs):

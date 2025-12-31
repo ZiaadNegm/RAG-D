@@ -7,6 +7,7 @@ from warp.infra.config.config import ColBERTConfig
 from warp.utils.tracker import NOPTracker
 from warp.utils.utils import print_message
 from warp.engine.constants import TPrimePolicy, T_PRIME_MAX
+from warp.engine.utils.oracle_scorer import OracleScorer, compute_m4_oracle_and_record
 
 from torch.utils.cpp_extension import load
 
@@ -127,6 +128,30 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
 
         print("nprobe", self.nprobe, "t_prime", self.t_prime, "nbits", config.nbits)
         self.bound = bound or 128
+        
+        # Oracle scorer for M4 measurement (lazily initialized when needed)
+        self._oracle_scorer = None
+        self._reverse_index = None
+    
+    def _get_oracle_scorer(self):
+        """Lazily initialize oracle scorer (only when M4 measurements are enabled)."""
+        if self._oracle_scorer is None:
+            from warp.engine.utils.reverse_index import ReverseIndex
+            
+            # Load or build reverse index
+            self._reverse_index = ReverseIndex.load_or_build(self.index_path)
+            
+            # Create oracle scorer
+            self._oracle_scorer = OracleScorer(
+                reverse_index=self._reverse_index,
+                centroids=self.centroids,
+                residuals_compacted=self.residuals_compacted,
+                bucket_weights=self.bucket_weights,
+                offsets_compacted=self.offsets_compacted,
+                nbits=self.nbits,
+                oracle_cpp=ParallelIndexScorerWARP.oracle_scorer_cpp
+            )
+        return self._oracle_scorer
 
     @classmethod
     def try_load_torch_extensions(cls, use_gpu):
@@ -209,6 +234,24 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
         cls.fused_decompress_merge_cpp[2] = fused_decompress_merge_cpp.parallel_fused_decompress_merge_2_cpp
         cls.fused_decompress_merge_cpp[4] = fused_decompress_merge_cpp.parallel_fused_decompress_merge_4_cpp
 
+        print_message(
+            f"Loading parallel_oracle_scorer_cpp extension (set WARP_LOAD_TORCH_EXTENSION_VERBOSE=True for more info)..."
+        )
+        cls.oracle_scorer_cpp = dict()
+        oracle_scorer_module = load(
+            name="parallel_oracle_scorer_cpp",
+            sources=[
+                os.path.join(
+                    pathlib.Path(__file__).parent.resolve(),
+                    "parallel_oracle_scorer.cpp",
+                ),
+            ],
+            extra_cflags=cflags,
+            verbose=os.getenv("WARP_LOAD_TORCH_EXTENSION_VERBOSE", "False") == "True",
+        )
+        cls.oracle_scorer_cpp[2] = oracle_scorer_module.compute_oracle_batch_2_cpp
+        cls.oracle_scorer_cpp[4] = oracle_scorer_module.compute_oracle_batch_4_cpp
+
         cls.loaded_extensions = True
 
     def rank(self, config, Q, k=100, filter_fn=None, pids=None, tracker=NOPTracker()):
@@ -257,6 +300,20 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
                 
                 # Record M3 winners for top-k documents
                 self._record_m3_winners(tracker, pids, phase1_pids, phase1_scores, phase1_winners, phase1_sizes, num_tokens)
+                
+                # Compute and record M4 oracle winners for all scored documents
+                # M4 scope = all docs that appeared in Phase 1 strides (same as M3)
+                # Note: M4 is a measurement pass, not a core pipeline step
+                if tracker.m4_tracking_enabled:
+                    all_scored_docs = self._get_all_scored_docs(phase1_pids, phase1_sizes, num_tokens)
+                    oracle_scorer = self._get_oracle_scorer()
+                    compute_m4_oracle_and_record(
+                        tracker=tracker,
+                        oracle_scorer=oracle_scorer,
+                        Q=Q.squeeze(0),
+                        all_scored_docs=all_scored_docs,
+                        num_tokens=num_tokens
+                    )
             
             elif self.fused_decompression_merge:
                 tracker.begin("Decompression")
@@ -291,6 +348,10 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
             # Uses helper function to avoid code duplication between fused/non-fused paths
             # See MEASUREMENT_WISHES.MD and M1_INTEGRATION_PLAN.md
             self._record_m1_measurements(tracker, cells, num_tokens)
+            
+            # R0 Measurement: Record selected centroids per query token
+            # Needed for M5 miss detection (comparing oracle winner's centroid against selected centroids)
+            self._record_r0_selected_centroids(tracker, cells, num_tokens)
 
             return pids, scores
 
@@ -412,6 +473,36 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
                         num_token_token_sims=num_sims
                     )
 
+    def _record_r0_selected_centroids(self, tracker, cells, num_tokens):
+        """
+        Record R0: selected centroids per query token.
+        
+        R0 records which centroids were selected for each query token, needed
+        for M5 miss detection (comparing oracle winner's centroid against
+        selected centroids).
+        
+        Args:
+            tracker: ExecutionTracker with measurements_enabled
+            cells: Tensor of selected centroid IDs [32 * nprobe] (flattened)
+            num_tokens: Number of actual query tokens
+        
+        See M4_INTEGRATION_PLAN.md for R0 specification.
+        """
+        if not tracker.measurements_enabled:
+            return
+        
+        for t in range(num_tokens):
+            for rank in range(self.nprobe):
+                idx = t * self.nprobe + rank
+                centroid_id = cells[idx].item()
+                # Skip dummy centroids (masked out tokens)
+                if centroid_id != self.kdummy_centroid:
+                    tracker.record_r0_centroid(
+                        q_token_id=t,
+                        centroid_id=centroid_id,
+                        rank=rank
+                    )
+
     def _record_m3_winners(self, tracker, top_k_pids, phase1_pids, phase1_scores, phase1_winners, phase1_sizes, num_tokens):
         """
         Record M3 winners for top-k documents.
@@ -459,3 +550,28 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
                         winner_score=winner_score
                     )
                 # else: doc didn't have observed evidence for this token (MSE fallback)
+
+    def _get_all_scored_docs(self, phase1_pids, phase1_sizes, num_tokens):
+        """
+        Get all documents that were scored in Phase 1 (union across all tokens).
+        
+        This returns the same document set that M3 observes, ensuring M4 oracle
+        is computed for the exact same documents.
+        
+        Args:
+            phase1_pids: List of 32 tensors, each containing doc IDs for that token
+            phase1_sizes: Tensor of sizes [32]
+            num_tokens: Number of actual query tokens
+        
+        Returns:
+            List of unique doc IDs across all tokens
+        """
+        all_docs = set()
+        phase1_sizes_np = phase1_sizes.numpy()
+        
+        for t in range(num_tokens):
+            size = phase1_sizes_np[t]
+            if size > 0:
+                all_docs.update(phase1_pids[t][:size].tolist())
+        
+        return list(all_docs)
