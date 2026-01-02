@@ -1,0 +1,16 @@
+{
+  "P4": {
+    "experiment": "P4",
+    "num_queries": 100,
+    "avg_decompression_ms": 3.1052796181757003,
+    "avg_merge_ms": 1.2053439114242792,
+    "estimated_phase1_ms": 1.1333660285619764,
+    "estimated_phase2_ms": 0.07197788286230287,
+    "phase1_task_fraction": 0.9402843601895735,
+    "extraction_overhead_percent": 2.319850001126864
+  },
+  "metadata": {
+    "timestamp": "2025-12-30T18:21:17.553768",
+    "threads": 4
+  }
+}

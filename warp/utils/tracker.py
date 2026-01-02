@@ -316,26 +316,29 @@ class MeasurementCollector:
         query_id: int,
         q_token_id: int,
         centroid_id: int,
-        rank: int
+        rank: int,
+        centroid_score: float = 0.0
     ) -> None:
         """
         Record R0 metric: selected centroid for a query token.
         
         R0 records which centroids were selected for each query token,
         needed for M5 miss detection (comparing oracle winner's centroid
-        against selected centroids).
+        against selected centroids) and routing fidelity metrics (C4/C5).
         
         Args:
             query_id: Query identifier
             q_token_id: Query token position (0-31)
             centroid_id: The selected centroid ID
             rank: Rank among nprobe selections (0 = best scoring)
+            centroid_score: The centroid's routing score (query-centroid similarity)
         
         Schema for R0_selected_centroids.parquet:
             - query_id: int32
             - q_token_id: int8
             - centroid_id: int32
             - rank: int8
+            - centroid_score: float32
         """
         if isinstance(query_id, str):
             query_id = int(query_id)
@@ -345,7 +348,8 @@ class MeasurementCollector:
                 "query_id": query_id,
                 "q_token_id": q_token_id,
                 "centroid_id": centroid_id,
-                "rank": rank
+                "rank": rank,
+                "centroid_score": centroid_score
             })
             
             if len(self._r0_buffer) >= self.BUFFER_FLUSH_THRESHOLD:
@@ -360,7 +364,8 @@ class MeasurementCollector:
             ("query_id", pa.int32()),
             ("q_token_id", pa.int8()),
             ("centroid_id", pa.int32()),
-            ("rank", pa.int8())
+            ("rank", pa.int8()),
+            ("centroid_score", pa.float32())
         ])
         
         table = pa.Table.from_pylist(self._r0_buffer, schema=schema)
@@ -839,6 +844,7 @@ class ExecutionTracker:
         q_token_id: int,
         centroid_id: int,
         rank: int,
+        centroid_score: float = 0.0,
         query_id: Optional[int] = None
     ):
         """
@@ -848,6 +854,7 @@ class ExecutionTracker:
             q_token_id: Query token position (0-31)
             centroid_id: The selected centroid ID
             rank: Rank among nprobe selections (0 = best scoring)
+            centroid_score: The centroid's routing score (query-centroid similarity)
             query_id: Query ID (optional, uses current iteration's query_id if not provided)
         """
         qid = query_id if query_id is not None else self._current_query_id
@@ -858,7 +865,8 @@ class ExecutionTracker:
             query_id=qid,
             q_token_id=q_token_id,
             centroid_id=centroid_id,
-            rank=rank
+            rank=rank,
+            centroid_score=centroid_score
         )
     
     def record_m4_winner(
@@ -1050,7 +1058,7 @@ class NOPTracker:
     def record_m3_winner(self, q_token_id, doc_id, winner_embedding_pos, winner_score, query_id=None):
         pass
     
-    def record_r0_centroid(self, q_token_id, centroid_id, rank, query_id=None):
+    def record_r0_centroid(self, q_token_id, centroid_id, rank, centroid_score=0.0, query_id=None):
         pass
     
     def record_m4_winner(self, q_token_id, doc_id, oracle_embedding_pos, oracle_score, query_id=None):

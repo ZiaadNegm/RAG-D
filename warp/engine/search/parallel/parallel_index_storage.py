@@ -351,7 +351,8 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
             
             # R0 Measurement: Record selected centroids per query token
             # Needed for M5 miss detection (comparing oracle winner's centroid against selected centroids)
-            self._record_r0_selected_centroids(tracker, cells, num_tokens)
+            # and routing fidelity metrics (C4/C5) which require centroid_scores
+            self._record_r0_selected_centroids(tracker, cells, centroid_scores, num_tokens)
 
             return pids, scores
 
@@ -473,17 +474,18 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
                         num_token_token_sims=num_sims
                     )
 
-    def _record_r0_selected_centroids(self, tracker, cells, num_tokens):
+    def _record_r0_selected_centroids(self, tracker, cells, centroid_scores, num_tokens):
         """
         Record R0: selected centroids per query token.
         
         R0 records which centroids were selected for each query token, needed
         for M5 miss detection (comparing oracle winner's centroid against
-        selected centroids).
+        selected centroids) and routing fidelity metrics (C4/C5).
         
         Args:
             tracker: ExecutionTracker with measurements_enabled
             cells: Tensor of selected centroid IDs [32 * nprobe] (flattened)
+            centroid_scores: Tensor of centroid routing scores [32 * nprobe] (flattened)
             num_tokens: Number of actual query tokens
         
         See M4_INTEGRATION_PLAN.md for R0 specification.
@@ -495,12 +497,14 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
             for rank in range(self.nprobe):
                 idx = t * self.nprobe + rank
                 centroid_id = cells[idx].item()
+                centroid_score = centroid_scores[idx].item()
                 # Skip dummy centroids (masked out tokens)
                 if centroid_id != self.kdummy_centroid:
                     tracker.record_r0_centroid(
                         q_token_id=t,
                         centroid_id=centroid_id,
-                        rank=rank
+                        rank=rank,
+                        centroid_score=centroid_score
                     )
 
     def _record_m3_winners(self, tracker, top_k_pids, phase1_pids, phase1_scores, phase1_winners, phase1_sizes, num_tokens):
