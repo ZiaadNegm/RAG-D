@@ -283,6 +283,10 @@ def step_4_compute_online_metrics(config, run_dir: str) -> dict:
         good_yield_threshold=config.online.good_yield_threshold,
         num_workers=config.online.num_workers,
         recall_k_values=config.online.recall_k_values,
+        # Streamlining flags
+        skip_c4_routing_fidelity=getattr(config.online, 'skip_c4_routing_fidelity', True),
+        skip_b2_entropy=getattr(config.online, 'skip_b2_entropy', True),
+        c2_internal_only=getattr(config.online, 'c2_internal_only', True),
     )
     
     output_dir = str(Path(run_dir) / "cluster_properties_online")
@@ -307,6 +311,143 @@ def step_4_compute_online_metrics(config, run_dir: str) -> dict:
         "output_dir": output_dir,
         "elapsed_seconds": elapsed,
         "summary": results.get("global_summary", {}),
+    }
+
+
+def step_5_create_unified_centroid_table(config, run_dir: str) -> dict:
+    """
+    Step 5: Create unified centroid table for SQ2 correlation analysis.
+    
+    Merges all per-centroid metrics into a single table:
+    - Offline properties (A1-A5, B5) from index
+    - Online aggregates (A4/yield, A6/sel_freq, B4/hub_type) from run
+    - M6 miss counts from derived metrics
+    
+    This enables direct correlation analysis: e.g., "Are large clusters (A1)
+    associated with low yields (A4) and high misses (M6)?"
+    """
+    import pandas as pd
+    
+    print("\n" + "=" * 70)
+    print("STEP 5: Create Unified Centroid Table (SQ2 Correlation Analysis)")
+    print("=" * 70)
+    
+    start_time = time.time()
+    run_path = Path(run_dir)
+    
+    # Source paths
+    offline_path = Path(config.index_path) / "cluster_properties_offline.parquet"
+    online_path = run_path / "cluster_properties_online" / "centroid_aggregates.parquet"
+    m6_path = run_path / "tier_a" / "M6_missed_centroids_global.parquet"
+    
+    # Check what's available
+    sources_found = []
+    
+    # 1. Load offline cluster properties (A1-A5, B5)
+    offline_df = None
+    if offline_path.exists():
+        offline_df = pd.read_parquet(offline_path)
+        sources_found.append(f"offline ({len(offline_df)} centroids)")
+        print(f"  ✓ Offline properties: {offline_path}")
+    else:
+        print(f"  ✗ Offline properties NOT FOUND: {offline_path}")
+    
+    # 2. Load online aggregates (A4, A6, B4)
+    online_df = None
+    if online_path.exists():
+        online_df = pd.read_parquet(online_path)
+        sources_found.append(f"online ({len(online_df)} centroids)")
+        print(f"  ✓ Online aggregates: {online_path}")
+    else:
+        print(f"  ✗ Online aggregates NOT FOUND: {online_path}")
+    
+    # 3. Load M6 miss counts
+    m6_df = None
+    if m6_path.exists():
+        m6_df = pd.read_parquet(m6_path)
+        sources_found.append(f"M6 ({len(m6_df)} centroids with misses)")
+        print(f"  ✓ M6 miss counts: {m6_path}")
+    else:
+        print(f"  ✗ M6 miss counts NOT FOUND: {m6_path}")
+    
+    if not sources_found:
+        print("\n  ERROR: No source data found. Run previous steps first.")
+        return {"error": "No source data found", "elapsed_seconds": time.time() - start_time}
+    
+    # Start building unified table
+    print(f"\nMerging sources: {', '.join(sources_found)}")
+    
+    # Use offline as base (has all centroids), or online if offline missing
+    if offline_df is not None:
+        unified = offline_df.copy()
+        base_col = 'centroid_id'
+    elif online_df is not None:
+        unified = online_df.copy()
+        base_col = 'centroid_id'
+    else:
+        # Only M6 available - use oracle_centroid_id as base
+        unified = m6_df[['oracle_centroid_id']].copy()
+        unified = unified.rename(columns={'oracle_centroid_id': 'centroid_id'})
+        base_col = 'centroid_id'
+    
+    # Merge online aggregates
+    if online_df is not None and offline_df is not None:
+        # Avoid duplicate columns
+        online_cols_to_add = [c for c in online_df.columns if c not in unified.columns or c == 'centroid_id']
+        unified = unified.merge(
+            online_df[online_cols_to_add],
+            on='centroid_id',
+            how='left'
+        )
+    
+    # Merge M6 misses
+    if m6_df is not None:
+        m6_renamed = m6_df.rename(columns={'oracle_centroid_id': 'centroid_id'})
+        # Select only miss-related columns
+        m6_cols = ['centroid_id', 'miss_count', 'oracle_win_count', 'miss_rate']
+        m6_cols = [c for c in m6_cols if c in m6_renamed.columns]
+        unified = unified.merge(
+            m6_renamed[m6_cols],
+            on='centroid_id',
+            how='left'
+        )
+        # Fill NaN (centroids with no misses)
+        for col in ['miss_count', 'oracle_win_count', 'miss_rate']:
+            if col in unified.columns:
+                unified[col] = unified[col].fillna(0)
+    
+    # Save unified table
+    output_path = run_path / "unified_centroid_table.parquet"
+    unified.to_parquet(output_path, index=False)
+    
+    elapsed = time.time() - start_time
+    
+    # Print summary
+    print(f"\nUnified table created: {output_path}")
+    print(f"  Total centroids: {len(unified):,}")
+    print(f"  Columns: {len(unified.columns)}")
+    print(f"  Column list: {list(unified.columns)}")
+    
+    # Quick correlation preview if we have the key columns
+    if 'n_tokens' in unified.columns and 'yield' in unified.columns:
+        # Filter to centroids that were actually used (sel_freq > 0)
+        used = unified[unified.get('sel_freq', 0) > 0] if 'sel_freq' in unified.columns else unified
+        if len(used) > 10:
+            corr_size_yield = used['n_tokens'].corr(used['yield'])
+            print(f"\n  Quick correlation preview (used centroids only):")
+            print(f"    Corr(n_tokens, yield) = {corr_size_yield:.3f}")
+            if 'miss_count' in used.columns and used['miss_count'].sum() > 0:
+                corr_size_miss = used['n_tokens'].corr(used['miss_count'])
+                print(f"    Corr(n_tokens, miss_count) = {corr_size_miss:.3f}")
+    
+    print(f"\nStep 5 complete in {elapsed:.1f}s")
+    
+    return {
+        "output_path": str(output_path),
+        "elapsed_seconds": elapsed,
+        "num_centroids": len(unified),
+        "columns": list(unified.columns),
+        "sources_merged": sources_found,
     }
 
 
@@ -451,6 +592,10 @@ def main():
         help="Skip Step 4 (online cluster properties)"
     )
     parser.add_argument(
+        "--skip-unified", action="store_true",
+        help="Skip Step 5 (unified centroid table)"
+    )
+    parser.add_argument(
         "--run-dir", type=str, default=None,
         help="Use existing run directory (for skipping Step 1)"
     )
@@ -540,6 +685,13 @@ def main():
         results["steps"]["online_metrics"] = step4_result
     else:
         print("\nSkipping Step 4 (online metrics)")
+    
+    # Step 5: Create unified centroid table for SQ2 correlation analysis
+    if not args.skip_unified:
+        step5_result = step_5_create_unified_centroid_table(config, run_dir)
+        results["steps"]["unified_table"] = step5_result
+    else:
+        print("\nSkipping Step 5 (unified centroid table)")
     
     # Final summary
     results["completed_at"] = datetime.now().isoformat()

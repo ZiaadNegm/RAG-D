@@ -69,8 +69,13 @@ class OnlineMetricsConfig:
     # Parallelization
     num_workers: int = 8
     
-    # Recall@k values (C3)
+    # Recall@k values (C3 - now "oracle_evidence_recall")
     recall_k_values: List[int] = field(default_factory=lambda: [10, 100, 1000])
+    
+    # Streamlining flags (SQ2 cleanup)
+    skip_c4_routing_fidelity: bool = True   # C4 hit/miss redundant with M5
+    skip_b2_entropy: bool = True            # Keep Gini + top-p, remove entropy
+    c2_internal_only: bool = True           # Mark C2 as internal/debug metric
 
 
 @dataclass
@@ -151,7 +156,7 @@ PRODUCTION_CONFIG = MetricsRunConfig(
     index_path="/mnt/datasets/index/beir-quora.split=test.nbits=4",
     raw=RawMeasurementsConfig(
         num_queries=10000,        # Full test set
-        nprobe=16,
+        nprobe=32,                # Full nprobe for SQ2 analysis
         k=1000,                   # Deeper ranking analysis
         nbits=4,
         fused_ext=False,

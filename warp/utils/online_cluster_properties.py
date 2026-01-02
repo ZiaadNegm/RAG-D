@@ -77,8 +77,13 @@ class OnlineMetricsConfig:
     num_workers: int = 8               # Workers for heavy metrics
     chunk_size: int = 100              # Queries per parallel chunk
     
-    # Recall@k values (C3)
+    # Recall@k values (C3 - renamed to "oracle_evidence_recall")
     recall_k_values: List[int] = field(default_factory=lambda: [10, 100, 1000])
+    
+    # Streamlining flags (SQ2 cleanup)
+    skip_c4_routing_fidelity: bool = True   # C4 hit/miss redundant with M5
+    skip_b2_entropy: bool = True            # Keep Gini + top-p, skip entropy
+    c2_internal_only: bool = True           # Mark C2 as internal/debug metric
 
 
 # =============================================================================
@@ -450,6 +455,9 @@ class OnlineClusterPropertiesComputer:
         Compute B3: Traffic concentration metrics.
         
         Reuses compute_gini() and compute_entropy() utilities.
+        
+        Note: Entropy metrics can be skipped via config.skip_b2_entropy
+        (Gini + top-p shares are sufficient for SQ2 analysis)
         """
         self._log("  Computing B3: Traffic concentration...")
         
@@ -467,12 +475,15 @@ class OnlineClusterPropertiesComputer:
         
         result = {
             'gini': compute_gini(values),
-            'entropy': compute_entropy(values),
-            'normalized_entropy': compute_entropy(values, normalize=True),
             'top_1pct_share': sorted_vals[:top_1pct].sum() / total if total > 0 else 0,
             'top_5pct_share': sorted_vals[:top_5pct].sum() / total if total > 0 else 0,
             'top_10pct_share': sorted_vals[:top_10pct].sum() / total if total > 0 else 0,
         }
+        
+        # Entropy metrics (optional - skip if config.skip_b2_entropy)
+        if not self.config.skip_b2_entropy:
+            result['entropy'] = compute_entropy(values)
+            result['normalized_entropy'] = compute_entropy(values, normalize=True)
         
         self._log(f"    Gini: {result['gini']:.3f}")
         self._log(f"    Top 5% share: {result['top_5pct_share']:.1%}")
@@ -649,7 +660,10 @@ class OnlineClusterPropertiesComputer:
     
     def compute_phase4_oracle_metrics(self, parallel: bool = True) -> Dict[str, Any]:
         """
-        Compute Phase 4 metrics: C3 (pruning recall), C6 (evidence dispersion).
+        Compute Phase 4 metrics: C3/C5 (oracle evidence recall), C6 (evidence dispersion).
+        
+        C3/C5 "Oracle Evidence Recall": How much of the oracle-best evidence
+        appears in the actual top-k ranking? (Renamed from "pruning recall")
         
         These operate on M4 data which is large (~96K rows per query).
         Parallelization is recommended for large runs.
@@ -659,14 +673,14 @@ class OnlineClusterPropertiesComputer:
             
         Returns:
             Dictionary with:
-            - pruning_recall: DataFrame with recall@k per query
-            - evidence_dispersion: DataFrame with dispersion per (query, doc)
+            - oracle_evidence_recall: DataFrame with recall@k per query (C3/C5)
+            - evidence_dispersion_summary: Summary stats for C6
         """
         self._log("\n=== Phase 4: Oracle Metrics (M4) ===")
         start = time.time()
         
-        # C3: Pruning recall
-        recall_df = self._compute_pruning_recall()
+        # C3/C5: Oracle evidence recall (renamed from pruning recall)
+        recall_df = self._compute_oracle_evidence_recall()
         
         # C6: Evidence dispersion (can be large, compute summary only)
         dispersion_summary = self._compute_evidence_dispersion_summary()
@@ -674,21 +688,24 @@ class OnlineClusterPropertiesComputer:
         self._log(f"  Phase 4 completed in {time.time() - start:.1f}s")
         
         return {
-            'pruning_recall': recall_df,
+            'oracle_evidence_recall': recall_df,
             'evidence_dispersion_summary': dispersion_summary,
         }
     
-    def _compute_pruning_recall(self, parallel: bool = True) -> pd.DataFrame:
+    def _compute_oracle_evidence_recall(self, parallel: bool = True) -> pd.DataFrame:
         """
-        Compute C3: Pruning recall at ranking level.
+        Compute C3/C5: Oracle evidence recall at ranking level.
         
-        Oracle ranking is derived by summing M4 oracle MaxSim scores per document.
-        Actual ranking is derived by summing M3 observed MaxSim scores per document.
+        (Renamed from "pruning recall" for clarity)
+        
+        Measures how much of the oracle-best evidence appears in the actual top-k.
+        - Oracle ranking: sum of M4 oracle MaxSim scores per document
+        - Actual ranking: sum of M3 observed MaxSim scores per document
         
         Args:
             parallel: Whether to parallelize across queries (recommended for large runs)
         """
-        self._log("  Computing C3: Pruning recall...")
+        self._log("  Computing C3/C5: Oracle evidence recall...")
         
         k_values = self.config.recall_k_values
         num_workers = self.config.num_workers
@@ -894,11 +911,16 @@ class OnlineClusterPropertiesComputer:
         # Phase 3: Yield and hub classification (M1 + M3)
         results['phase3'] = self.compute_phase3_yield_metrics()
         
-        # Phase 4: Oracle metrics (M4)
+        # Phase 4: Oracle metrics (M4) - C3 renamed to "oracle_evidence_recall"
         results['phase4'] = self.compute_phase4_oracle_metrics()
         
-        # Phase 5: Routing fidelity (M4 + R0)
-        results['phase5'] = self.compute_phase5_routing_fidelity()
+        # Phase 5: Routing fidelity (M4 + R0) - C4 hit/miss rate
+        # Note: Can be skipped via config.skip_c4_routing_fidelity (redundant with M5)
+        if not self.config.skip_c4_routing_fidelity:
+            results['phase5'] = self.compute_phase5_routing_fidelity()
+        else:
+            self._log("\n=== Phase 5: Routing Fidelity (SKIPPED - redundant with M5) ===")
+            results['phase5'] = {'skipped': True, 'reason': 'redundant with M5'}
         
         total_time = time.time() - start
         self._log(f"\n{'='*70}")
@@ -930,7 +952,7 @@ class OnlineClusterPropertiesComputer:
         
         # Per-query metrics (merge activation and recall)
         per_query = results['phase2']['per_query_activation']
-        recall_df = results['phase4']['pruning_recall']
+        recall_df = results['phase4']['oracle_evidence_recall']
         
         per_query_full = per_query.merge(recall_df, on='query_id', how='left')
         per_query_full.to_parquet(self.output_dir / "per_query_metrics.parquet", index=False)
@@ -949,10 +971,12 @@ class OnlineClusterPropertiesComputer:
                 'pure_waste_centroids': int((yield_df['influential'] == 0).sum()),
             },
             'hub_classification': {k: int(v) for k, v in hub_df['hub_type'].value_counts().to_dict().items()},
-            'routing_fidelity': {k: float(v) if isinstance(v, (float, np.floating)) else int(v) 
-                                 for k, v in results['phase5'].items()},
+            'routing_fidelity': results['phase5'] if results['phase5'].get('skipped') else {
+                k: float(v) if isinstance(v, (float, np.floating)) else int(v) 
+                for k, v in results['phase5'].items()
+            },
             'evidence_dispersion': {k: float(v) for k, v in results['phase4']['evidence_dispersion_summary'].items()},
-            'pruning_recall': {
+            'oracle_evidence_recall': {  # Renamed from pruning_recall (C3/C5)
                 f'mean_recall@{k}': float(recall_df[f'recall@{k}'].mean())
                 for k in self.config.recall_k_values
                 if f'recall@{k}' in recall_df.columns
@@ -993,12 +1017,15 @@ class OnlineClusterPropertiesComputer:
         self._log(f"  Mean: {ys.get('mean_yield', 'N/A'):.4f}")
         self._log(f"  Pure waste centroids: {ys.get('pure_waste_centroids', 'N/A'):,}")
         
-        self._log("\nRouting Fidelity:")
+        self._log("\nRouting Fidelity (C4):")
         rf = summary.get('routing_fidelity', {})
-        self._log(f"  Hit rate: {rf.get('hit_rate', 'N/A'):.1%}")
-        self._log(f"  Miss rate: {rf.get('miss_rate', 'N/A'):.1%}")
+        if rf.get('skipped'):
+            self._log(f"  (Skipped - {rf.get('reason', 'N/A')})")
+        else:
+            self._log(f"  Hit rate: {rf.get('hit_rate', 'N/A'):.1%}")
+            self._log(f"  Miss rate: {rf.get('miss_rate', 'N/A'):.1%}")
         
-        self._log("\nPruning Recall:")
-        pr = summary.get('pruning_recall', {})
+        self._log("\nOracle Evidence Recall (C3/C5):")
+        pr = summary.get('oracle_evidence_recall', summary.get('pruning_recall', {}))  # Backward compat
         for k, v in pr.items():
             self._log(f"  {k}: {v:.3f}")
