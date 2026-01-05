@@ -1,0 +1,35 @@
+# Prod Configuration - Final Statistical Power
+# Purpose: Stable estimates, tail risk analysis, stratified analyses, robust conclusions
+# Runtime target: hours to days (acceptable for final analysis)
+
+name: prod
+
+# Query scope: full dataset for statistical power
+num_queries: null  # null = use all available queries
+query_sample_seed: 42
+
+# Paths
+paths:
+  index_path: /mnt/datasets/index/beir-quora.split=test.nbits=4
+  run_dir: /mnt/tmp/warp_measurements/production_beir_quora/runs/metrics_production_20260104_115425
+  output_root: /mnt/hypothesis_outputs/prod
+
+# Processing: optimized for throughput
+processing:
+  m4_chunk_size: 1000      # Larger chunks for efficiency (more RAM)
+  max_memory_gb: 32.0      # Allow more memory usage
+  num_workers: 16          # Maximum parallelism
+  parallel_reads: true
+  cache_standardized_tables: true
+  cache_dir: /mnt/hypothesis_outputs/cache/prod
+
+# Output  
+verbose: true
+progress_bars: true
+
+# Production checklist:
+# - [ ] Sufficient queries for desired statistical power
+# - [ ] Confidence intervals computed
+# - [ ] Bootstrap validation completed
+# - [ ] Results saved in archival format
+# - [ ] Figures publication-ready

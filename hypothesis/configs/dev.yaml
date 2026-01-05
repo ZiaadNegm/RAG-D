@@ -1,0 +1,35 @@
+# Dev Configuration - Signal Exploration
+# Purpose: Distributions look plausible, early hypothesis sanity, catch edge cases
+# Runtime target: 0.5-3 hours (depending on index + logging)
+
+name: dev
+
+# Query scope: enough for reasonable statistical signal
+num_queries: 1000
+query_sample_seed: 42
+
+# Paths
+paths:
+  index_path: /mnt/datasets/index/beir-quora.split=test.nbits=4
+  run_dir: /mnt/tmp/warp_measurements/production_beir_quora/runs/metrics_production_20260104_115425
+  output_root: /mnt/hypothesis_outputs/dev
+
+# Processing: balanced settings
+processing:
+  m4_chunk_size: 500       # Standard chunk size
+  max_memory_gb: 16.0      # Moderate memory
+  num_workers: 8           # Full parallelism
+  parallel_reads: true
+  cache_standardized_tables: true
+  cache_dir: /mnt/hypothesis_outputs/cache/dev
+
+# Output
+verbose: true
+progress_bars: true
+
+# Development checklist:
+# - [ ] Distribution shapes are plausible
+# - [ ] No unexpected nulls or infinities
+# - [ ] Correlations have expected signs
+# - [ ] Stratified analyses show differentiation
+# - [ ] Edge cases handled (empty clusters, etc.)

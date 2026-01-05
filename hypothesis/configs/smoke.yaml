@@ -1,0 +1,35 @@
+# Smoke Configuration - Fast Sanity Checks
+# Purpose: Does it run end-to-end, no OOM, files written, plots render
+# Runtime target: minutes
+
+name: smoke
+
+# Query scope: very small sample for fast iteration
+num_queries: 50
+query_sample_seed: 42
+
+# Paths (using default dev run for now)
+paths:
+  index_path: /mnt/datasets/index/beir-quora.split=test.nbits=4
+  run_dir: /mnt/tmp/online_dev_v2/runs/m4_e2e_20260102_123805
+  output_root: /mnt/hypothesis_outputs/smoke
+
+# Processing: conservative settings
+processing:
+  m4_chunk_size: 100       # Small chunks for safety
+  max_memory_gb: 8.0       # Conservative memory limit
+  num_workers: 4           # Fewer workers
+  parallel_reads: true
+  cache_standardized_tables: true
+  cache_dir: /mnt/hypothesis_outputs/cache/smoke
+
+# Output
+verbose: true
+progress_bars: true
+
+# Test checklist (for validation):
+# - [ ] All metrics files load without error
+# - [ ] cluster_frame builds successfully  
+# - [ ] No OOM during M4 processing
+# - [ ] Basic plots render
+# - [ ] Output files written to expected locations
