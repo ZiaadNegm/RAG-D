@@ -46,6 +46,7 @@ class MeasurementCollector:
     2. Buffering measurement data in memory
     3. Flushing buffers to Parquet files when threshold is reached
     4. Writing metadata.json with run configuration
+    5. Query-based chunking for crash resilience (new!)
     
     Directory structure created:
         /mnt/warp_measurements/
@@ -53,26 +54,29 @@ class MeasurementCollector:
             └── {run_id}/
                 ├── metadata.json
                 ├── tier_a/
-                │   ├── R0_selected_centroids.parquet
-                │   ├── M1_compute_per_centroid.parquet
-                │   ├── M3_docs_touched.parquet
-                │   └── M6_missed_centroids_global.parquet
+                │   ├── M1_compute_per_centroid_chunk_0000.parquet
+                │   ├── M1_compute_per_centroid_chunk_0001.parquet
+                │   └── ... (merged to M1_compute_per_centroid.parquet at end)
                 └── tier_b/
-                    ├── winners.parquet
-                    └── M6_per_query.parquet
+                    ├── R0_selected_centroids_chunk_XXXX.parquet
+                    ├── M3_observed_winners_chunk_XXXX.parquet
+                    └── M4_oracle_winners_chunk_XXXX.parquet
     
     Usage:
         collector = MeasurementCollector(
             run_id="2024-12-30_quora_nprobe8",
-            output_dir="/mnt/warp_measurements"
+            output_dir="/mnt/warp_measurements",
+            query_chunk_size=500  # Flush to disk every 500 queries
         )
         
         # During search loop
         collector.record_m1(query_id=0, q_token_id=1, centroid_id=42, num_sims=1500)
+        collector.signal_query_complete(query_id=0)  # Call after each query
         
         # At end of run
         collector.save_metadata({...})
         collector.flush_all()
+        collector.merge_chunks()  # Merge chunk files into final files
     
     See MEASUREMENT_WISHES.MD for full specification.
     """
@@ -82,6 +86,10 @@ class MeasurementCollector:
     # With ~30 bytes per M1 row, 10K rows ≈ 300KB memory per buffer.
     BUFFER_FLUSH_THRESHOLD = 10_000
     
+    # Query chunk size: flush all buffers to disk every N queries for crash resilience.
+    # 500 queries ≈ 2-3 minutes of work, good balance between I/O and resilience.
+    DEFAULT_QUERY_CHUNK_SIZE = 500
+    
     # Default output directory (can be overridden)
     DEFAULT_OUTPUT_DIR = "/mnt/warp_measurements"
     
@@ -90,7 +98,8 @@ class MeasurementCollector:
         run_id: str,
         output_dir: Optional[str] = None,
         index_path: Optional[str] = None,
-        create_dirs: bool = True
+        create_dirs: bool = True,
+        query_chunk_size: Optional[int] = None
     ):
         """
         Initialize the measurement collector.
@@ -100,6 +109,8 @@ class MeasurementCollector:
             output_dir: Base directory for measurements. Defaults to /mnt/warp_measurements
             index_path: Path to the WARP index being used (for metadata)
             create_dirs: If True, create directory structure immediately
+            query_chunk_size: Number of queries per chunk file. Defaults to 500.
+                             Set to None or 0 to disable chunking (single file mode).
         """
         self.run_id = run_id
         self.output_dir = Path(output_dir or self.DEFAULT_OUTPUT_DIR)
@@ -130,6 +141,21 @@ class MeasurementCollector:
         
         # Track flush counts for debugging
         self._flush_counts = {"m1": 0, "r0": 0, "m3a": 0, "m3b": 0, "m4": 0}
+        
+        # Track flush IDs per metric (for unique filenames within a chunk)
+        # This fixes a bug where multiple flushes within the same chunk would overwrite each other
+        self._flush_ids = {"m1": 0, "r0": 0, "m3a": 0, "m3b": 0, "m4": 0}
+        
+        # Query-based chunking for crash resilience
+        self._query_chunk_size = query_chunk_size if query_chunk_size else self.DEFAULT_QUERY_CHUNK_SIZE
+        self._chunking_enabled = self._query_chunk_size > 0
+        self._current_chunk_id = 0
+        self._queries_in_current_chunk = 0
+        self._last_completed_query_id: Optional[int] = None
+        self._total_queries_completed = 0
+        
+        # Track chunk files for each metric (for merging later)
+        self._chunk_files = {"m1": [], "r0": [], "m3b": [], "m4": []}
         
         # Setup directories
         if create_dirs:
@@ -194,11 +220,16 @@ class MeasurementCollector:
             if len(self._m1_buffer) >= self.BUFFER_FLUSH_THRESHOLD:
                 self._flush_m1_buffer()
     
-    def _flush_m1_buffer(self) -> None:
+    def _flush_m1_buffer(self, force_chunk: bool = False) -> None:
         """
         Write M1 buffer to Parquet file and clear buffer.
         
-        Uses PyArrow for efficient columnar storage with append support.
+        Uses PyArrow for efficient columnar storage.
+        When chunking is enabled, writes to separate chunk files instead of
+        appending to a single file (avoids expensive read-concat-write).
+        
+        Args:
+            force_chunk: If True, write as a new chunk file even if chunking disabled
         """
         if not self._m1_buffer:
             return
@@ -214,15 +245,21 @@ class MeasurementCollector:
         # Convert to PyArrow table
         table = pa.Table.from_pylist(self._m1_buffer, schema=schema)
         
-        # Write to parquet (append if file exists)
-        parquet_path = self.tier_a_dir / "M1_compute_per_centroid.parquet"
-        
-        if parquet_path.exists():
-            # Read existing and concatenate
-            existing = pq.read_table(parquet_path)
-            table = pa.concat_tables([existing, table])
-        
-        pq.write_table(table, parquet_path, compression='snappy')
+        if self._chunking_enabled or force_chunk:
+            # Write to chunk file with unique flush ID (no read-concat-write overhead)
+            # Format: chunk_{chunk_id}_{flush_id} to ensure each flush creates a unique file
+            flush_id = self._flush_ids["m1"]
+            chunk_path = self.tier_a_dir / f"M1_compute_per_centroid_chunk_{self._current_chunk_id:04d}_{flush_id:04d}.parquet"
+            pq.write_table(table, chunk_path, compression='snappy')
+            self._chunk_files["m1"].append(str(chunk_path))
+            self._flush_ids["m1"] += 1
+        else:
+            # Legacy: append to single file
+            parquet_path = self.tier_a_dir / "M1_compute_per_centroid.parquet"
+            if parquet_path.exists():
+                existing = pq.read_table(parquet_path)
+                table = pa.concat_tables([existing, table])
+            pq.write_table(table, parquet_path, compression='snappy')
         
         self._flush_counts["m1"] += 1
         self._m1_buffer = []
@@ -275,9 +312,12 @@ class MeasurementCollector:
             if len(self._m3b_buffer) >= self.BUFFER_FLUSH_THRESHOLD:
                 self._flush_m3b_buffer()
     
-    def _flush_m3b_buffer(self) -> None:
+    def _flush_m3b_buffer(self, force_chunk: bool = False) -> None:
         """
         Write M3 Tier B buffer to Parquet file and clear buffer.
+        
+        Args:
+            force_chunk: If True, write as a new chunk file even if chunking disabled
         """
         if not self._m3b_buffer:
             return
@@ -294,15 +334,20 @@ class MeasurementCollector:
         # Convert to PyArrow table
         table = pa.Table.from_pylist(self._m3b_buffer, schema=schema)
         
-        # Write to parquet in tier_b directory (append if file exists)
-        parquet_path = self.tier_b_dir / "M3_observed_winners.parquet"
-        
-        if parquet_path.exists():
-            # Read existing and concatenate
-            existing = pq.read_table(parquet_path)
-            table = pa.concat_tables([existing, table])
-        
-        pq.write_table(table, parquet_path, compression='snappy')
+        if self._chunking_enabled or force_chunk:
+            # Write to chunk file with unique flush ID
+            flush_id = self._flush_ids["m3b"]
+            chunk_path = self.tier_b_dir / f"M3_observed_winners_chunk_{self._current_chunk_id:04d}_{flush_id:04d}.parquet"
+            pq.write_table(table, chunk_path, compression='snappy')
+            self._chunk_files["m3b"].append(str(chunk_path))
+            self._flush_ids["m3b"] += 1
+        else:
+            # Legacy: append to single file
+            parquet_path = self.tier_b_dir / "M3_observed_winners.parquet"
+            if parquet_path.exists():
+                existing = pq.read_table(parquet_path)
+                table = pa.concat_tables([existing, table])
+            pq.write_table(table, parquet_path, compression='snappy')
         
         self._flush_counts["m3b"] += 1
         self._m3b_buffer = []
@@ -355,8 +400,13 @@ class MeasurementCollector:
             if len(self._r0_buffer) >= self.BUFFER_FLUSH_THRESHOLD:
                 self._flush_r0_buffer()
     
-    def _flush_r0_buffer(self) -> None:
-        """Write R0 buffer to Parquet file and clear buffer."""
+    def _flush_r0_buffer(self, force_chunk: bool = False) -> None:
+        """
+        Write R0 buffer to Parquet file and clear buffer.
+        
+        Args:
+            force_chunk: If True, write as a new chunk file even if chunking disabled
+        """
         if not self._r0_buffer:
             return
         
@@ -369,13 +419,21 @@ class MeasurementCollector:
         ])
         
         table = pa.Table.from_pylist(self._r0_buffer, schema=schema)
-        parquet_path = self.tier_b_dir / "R0_selected_centroids.parquet"
         
-        if parquet_path.exists():
-            existing = pq.read_table(parquet_path)
-            table = pa.concat_tables([existing, table])
-        
-        pq.write_table(table, parquet_path, compression='snappy')
+        if self._chunking_enabled or force_chunk:
+            # Write to chunk file with unique flush ID
+            flush_id = self._flush_ids["r0"]
+            chunk_path = self.tier_b_dir / f"R0_selected_centroids_chunk_{self._current_chunk_id:04d}_{flush_id:04d}.parquet"
+            pq.write_table(table, chunk_path, compression='snappy')
+            self._chunk_files["r0"].append(str(chunk_path))
+            self._flush_ids["r0"] += 1
+        else:
+            # Legacy: append to single file
+            parquet_path = self.tier_b_dir / "R0_selected_centroids.parquet"
+            if parquet_path.exists():
+                existing = pq.read_table(parquet_path)
+                table = pa.concat_tables([existing, table])
+            pq.write_table(table, parquet_path, compression='snappy')
         
         self._flush_counts["r0"] += 1
         self._r0_buffer = []
@@ -481,8 +539,13 @@ class MeasurementCollector:
             if len(self._m4_buffer) >= self.BUFFER_FLUSH_THRESHOLD:
                 self._flush_m4_buffer()
     
-    def _flush_m4_buffer(self) -> None:
-        """Write M4 buffer to Parquet file and clear buffer."""
+    def _flush_m4_buffer(self, force_chunk: bool = False) -> None:
+        """
+        Write M4 buffer to Parquet file and clear buffer.
+        
+        Args:
+            force_chunk: If True, write as a new chunk file even if chunking disabled
+        """
         if not self._m4_buffer:
             return
         
@@ -495,13 +558,21 @@ class MeasurementCollector:
         ])
         
         table = pa.Table.from_pylist(self._m4_buffer, schema=schema)
-        parquet_path = self.tier_b_dir / "M4_oracle_winners.parquet"
         
-        if parquet_path.exists():
-            existing = pq.read_table(parquet_path)
-            table = pa.concat_tables([existing, table])
-        
-        pq.write_table(table, parquet_path, compression='snappy')
+        if self._chunking_enabled or force_chunk:
+            # Write to chunk file with unique flush ID
+            flush_id = self._flush_ids["m4"]
+            chunk_path = self.tier_b_dir / f"M4_oracle_winners_chunk_{self._current_chunk_id:04d}_{flush_id:04d}.parquet"
+            pq.write_table(table, chunk_path, compression='snappy')
+            self._chunk_files["m4"].append(str(chunk_path))
+            self._flush_ids["m4"] += 1
+        else:
+            # Legacy: append to single file
+            parquet_path = self.tier_b_dir / "M4_oracle_winners.parquet"
+            if parquet_path.exists():
+                existing = pq.read_table(parquet_path)
+                table = pa.concat_tables([existing, table])
+            pq.write_table(table, parquet_path, compression='snappy')
         
         self._flush_counts["m4"] += 1
         self._m4_buffer = []
@@ -579,17 +650,183 @@ class MeasurementCollector:
             self._flush_r0_buffer()
             self._flush_m4_buffer()
         
-        # Update metadata with completion status
+        # Update metadata with completion status and chunking info
+        self._update_metadata_progress(tier_a_complete, tier_b_complete)
+    
+    def _update_metadata_progress(
+        self, 
+        tier_a_complete: bool = False, 
+        tier_b_complete: bool = False
+    ) -> None:
+        """Update metadata.json with current progress and chunking info."""
+        if not self.metadata_path.exists():
+            return
+        
+        with open(self.metadata_path, 'r') as f:
+            metadata = json.load(f)
+        
+        metadata["storage"]["tier_a_complete"] = tier_a_complete
+        metadata["storage"]["tier_b_complete"] = tier_b_complete
+        metadata["storage"]["flush_counts"] = self._flush_counts.copy()
+        
+        # Add chunking progress info
+        metadata["storage"]["chunking"] = {
+            "enabled": self._chunking_enabled,
+            "query_chunk_size": self._query_chunk_size,
+            "current_chunk_id": self._current_chunk_id,
+            "total_queries_completed": self._total_queries_completed,
+            "last_completed_query_id": self._last_completed_query_id,
+            "chunk_files": self._chunk_files.copy()
+        }
+        
+        with open(self.metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=4)
+    
+    # -------------------------------------------------------------------------
+    # Query-based chunking for crash resilience
+    # -------------------------------------------------------------------------
+    
+    def signal_query_complete(self, query_id: int) -> None:
+        """
+        Signal that a query has been fully processed.
+        
+        When query_chunk_size queries have been completed, all buffers are
+        flushed to disk as chunk files, providing crash resilience.
+        
+        Call this method at the end of each query's processing.
+        
+        Args:
+            query_id: The query ID that was just completed
+        """
+        if isinstance(query_id, str):
+            query_id = int(query_id)
+        
+        with self._lock:
+            self._queries_in_current_chunk += 1
+            self._total_queries_completed += 1
+            self._last_completed_query_id = query_id
+            
+            # Check if we should flush to a new chunk
+            if self._chunking_enabled and self._queries_in_current_chunk >= self._query_chunk_size:
+                self._flush_chunk()
+    
+    def _flush_chunk(self) -> None:
+        """
+        Flush all buffers to chunk files and advance to next chunk.
+        
+        Called internally when query_chunk_size queries have been processed.
+        Must be called with self._lock held.
+        """
+        # Flush all buffers (they write to chunk files based on _current_chunk_id)
+        self._flush_m1_buffer(force_chunk=True)
+        self._flush_m3b_buffer(force_chunk=True)
+        self._flush_r0_buffer(force_chunk=True)
+        self._flush_m4_buffer(force_chunk=True)
+        
+        # Update metadata with progress (for resume capability)
+        # Release lock temporarily for file I/O
+        self._lock.release()
+        try:
+            self._update_metadata_progress()
+            print(f"  [Chunk {self._current_chunk_id}] Saved {self._queries_in_current_chunk} queries "
+                  f"(total: {self._total_queries_completed}, last_qid: {self._last_completed_query_id})")
+        finally:
+            self._lock.acquire()
+        
+        # Advance to next chunk
+        self._current_chunk_id += 1
+        self._queries_in_current_chunk = 0
+    
+    def merge_chunks(self, delete_chunks: bool = True) -> Dict[str, str]:
+        """
+        Merge all chunk files into final Parquet files.
+        
+        Call this after all queries are processed to combine chunk files
+        into the final metric files (e.g., M1_compute_per_centroid.parquet).
+        
+        Args:
+            delete_chunks: If True, delete chunk files after successful merge
+            
+        Returns:
+            Dict mapping metric name to merged file path
+        """
+        merged_files = {}
+        
+        # Metric configurations: (chunk_prefix, final_name, tier_dir)
+        metrics = [
+            ("m1", "M1_compute_per_centroid", self.tier_a_dir),
+            ("r0", "R0_selected_centroids", self.tier_b_dir),
+            ("m3b", "M3_observed_winners", self.tier_b_dir),
+            ("m4", "M4_oracle_winners", self.tier_b_dir),
+        ]
+        
+        for metric_key, base_name, tier_dir in metrics:
+            # Find all chunk files for this metric
+            pattern = f"{base_name}_chunk_*.parquet"
+            chunk_paths = sorted(tier_dir.glob(pattern))
+            
+            if not chunk_paths:
+                continue
+            
+            print(f"Merging {len(chunk_paths)} chunk files for {base_name}...")
+            
+            # Read and concatenate all chunks
+            tables = []
+            for chunk_path in chunk_paths:
+                tables.append(pq.read_table(chunk_path))
+            
+            merged_table = pa.concat_tables(tables)
+            
+            # Write merged file
+            final_path = tier_dir / f"{base_name}.parquet"
+            pq.write_table(merged_table, final_path, compression='snappy')
+            merged_files[metric_key] = str(final_path)
+            
+            print(f"  -> {final_path} ({merged_table.num_rows:,} rows)")
+            
+            # Delete chunk files if requested
+            if delete_chunks:
+                for chunk_path in chunk_paths:
+                    chunk_path.unlink()
+                print(f"  -> Deleted {len(chunk_paths)} chunk files")
+        
+        # Update metadata to indicate merge complete
         if self.metadata_path.exists():
             with open(self.metadata_path, 'r') as f:
                 metadata = json.load(f)
             
-            metadata["storage"]["tier_a_complete"] = tier_a_complete
-            metadata["storage"]["tier_b_complete"] = tier_b_complete
-            metadata["storage"]["flush_counts"] = self._flush_counts.copy()
+            metadata["storage"]["chunks_merged"] = True
+            metadata["storage"]["merged_files"] = merged_files
             
             with open(self.metadata_path, 'w') as f:
                 json.dump(metadata, f, indent=4)
+        
+        return merged_files
+    
+    def get_resume_info(self) -> Optional[Dict[str, Any]]:
+        """
+        Get information needed to resume from a partial run.
+        
+        Returns:
+            Dict with resume info if partial chunks exist, None otherwise.
+            Contains: last_completed_query_id, total_queries_completed, current_chunk_id
+        """
+        if not self.metadata_path.exists():
+            return None
+        
+        with open(self.metadata_path, 'r') as f:
+            metadata = json.load(f)
+        
+        chunking_info = metadata.get("storage", {}).get("chunking")
+        if not chunking_info:
+            return None
+        
+        return {
+            "last_completed_query_id": chunking_info.get("last_completed_query_id"),
+            "total_queries_completed": chunking_info.get("total_queries_completed", 0),
+            "current_chunk_id": chunking_info.get("current_chunk_id", 0),
+            "chunk_files": chunking_info.get("chunk_files", {})
+        }
     
     def get_buffer_sizes(self) -> Dict[str, int]:
         """Return current buffer sizes for monitoring."""
@@ -621,14 +858,32 @@ class NOPMeasurementCollector:
     def record_m3b_winner(self, query_id, q_token_id, doc_id, winner_embedding_pos, winner_score):
         pass
     
+    def record_r0_centroid(self, query_id, q_token_id, centroid_id, rank, centroid_score=0.0):
+        pass
+    
+    def record_m4_winner(self, query_id, q_token_id, doc_id, oracle_embedding_pos, oracle_score):
+        pass
+    
+    def record_m4_batch(self, query_id, doc_ids, oracle_pos, oracle_scores, num_tokens):
+        pass
+    
+    def signal_query_complete(self, query_id):
+        pass
+    
     def save_metadata(self, **kwargs):
         pass
     
     def flush_all(self, **kwargs):
         pass
     
+    def merge_chunks(self, delete_chunks=True):
+        return {}
+    
     def get_buffer_sizes(self):
         return {}
+    
+    def get_resume_info(self):
+        return None
     
     @property
     def is_enabled(self):
@@ -658,6 +913,14 @@ class ExecutionTracker:
             measurement_output_dir="/mnt/warp_measurements"
         )
         
+        # With chunking for crash resilience
+        tracker = ExecutionTracker(
+            "WARP",
+            steps=["Step1", "Step2"],
+            measurement_run_id="2024-12-30_quora_nprobe8",
+            query_chunk_size=500  # Save progress every 500 queries
+        )
+        
         with tracker.iteration():
             tracker.begin("Step1")
             # ... do work ...
@@ -666,6 +929,7 @@ class ExecutionTracker:
         
         # At end of run
         tracker.finalize_measurements()
+        tracker.merge_chunks()  # Merge chunk files into final files
     """
     
     def __init__(
@@ -674,7 +938,8 @@ class ExecutionTracker:
         steps: List[str],
         measurement_run_id: Optional[str] = None,
         measurement_output_dir: Optional[str] = None,
-        index_path: Optional[str] = None
+        index_path: Optional[str] = None,
+        query_chunk_size: Optional[int] = None
     ):
         """
         Initialize the execution tracker.
@@ -687,6 +952,8 @@ class ExecutionTracker:
             measurement_output_dir: Base directory for measurements.
                                    Defaults to /mnt/warp_measurements
             index_path: Path to the WARP index (recorded in metadata)
+            query_chunk_size: Number of queries per chunk file for crash resilience.
+                             Defaults to 500. Set to 0 to disable chunking.
         """
         self._name = name
         self._steps = steps
@@ -715,7 +982,8 @@ class ExecutionTracker:
                 run_id=measurement_run_id,
                 output_dir=measurement_output_dir,
                 index_path=index_path,
-                create_dirs=True
+                create_dirs=True,
+                query_chunk_size=query_chunk_size
             )
         else:
             self._measurement_collector = NOPMeasurementCollector()
@@ -725,7 +993,6 @@ class ExecutionTracker:
         
         # M4 Oracle tracking flag (disabled by default due to compute overhead)
         self._m4_tracking_enabled = False
-
     @property
     def measurements_enabled(self) -> bool:
         """Check if measurement collection is enabled for this tracker."""
@@ -786,13 +1053,17 @@ class ExecutionTracker:
             self._legacy_metrics_current = {}
 
     def end_iteration(self):
-        """End the current iteration."""
+        """End the current iteration and signal query completion for chunking."""
         tok = time.time()
         if self._steps != self._current_steps:
             print(f"Warning: Expected steps {self._steps}, got {self._current_steps}")
         assert self._steps == self._current_steps, f"Step mismatch: {self._steps} != {self._current_steps}"
         self._iterating = False
         self._iter_time += tok - self._iter_begin
+        
+        # Signal query completion for chunked saving
+        if self._current_query_id is not None:
+            self._measurement_collector.signal_query_complete(self._current_query_id)
         
         # Legacy metrics
         with self._legacy_lock:
@@ -1012,6 +1283,24 @@ class ExecutionTracker:
             **kwargs
         )
         self._measurement_collector.flush_all(tier_a_complete=True)
+    
+    def merge_chunks(self, delete_chunks: bool = True) -> Dict[str, str]:
+        """
+        Merge chunk files into final Parquet files.
+        
+        Call this after finalize_measurements() to combine chunk files.
+        
+        Args:
+            delete_chunks: If True, delete chunk files after successful merge
+            
+        Returns:
+            Dict mapping metric name to merged file path
+        """
+        return self._measurement_collector.merge_chunks(delete_chunks=delete_chunks)
+    
+    def get_resume_info(self) -> Optional[Dict[str, Any]]:
+        """Get information needed to resume from a partial run."""
+        return self._measurement_collector.get_resume_info()
 
     # -------------------------------------------------------------------------
     # Summary and serialization

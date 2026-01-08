@@ -28,6 +28,7 @@ class RawMeasurementsConfig:
     # Storage
     output_dir: str = "/mnt/tmp/warp_measurements"
     buffer_flush_threshold: int = 10_000
+    query_chunk_size: int = 500  # Save progress every N queries (crash resilience)
     
     # Dataset
     collection: str = "beir"
@@ -55,6 +56,9 @@ class DerivedMetricsConfig:
     
     # M5/M6 scope
     top_k_only: bool = False  # If True, only compute for top-k docs
+    
+    # Chunked M4 processing (for large M4 files, >1GB)
+    m4_chunk_size: int = 500  # Number of queries per chunk
 
 
 @dataclass  
@@ -71,6 +75,9 @@ class OnlineMetricsConfig:
     
     # Recall@k values (C3 - now "oracle_evidence_recall")
     recall_k_values: List[int] = field(default_factory=lambda: [10, 100, 1000])
+    
+    # Chunked M4 processing (for large M4 files, >1GB)
+    m4_chunk_size: int = 500  # Number of queries per chunk for C3/C6
     
     # Streamlining flags (SQ2 cleanup)
     skip_c4_routing_fidelity: bool = True   # C4 hit/miss redundant with M5
@@ -119,6 +126,7 @@ TEST_CONFIG = MetricsRunConfig(
         num_threads=2,
         output_dir="/mnt/tmp/warp_measurements",
         buffer_flush_threshold=10_000,
+        query_chunk_size=25,      # Smaller chunks for test (2 chunks)
         collection="beir",
         dataset="quora",
         datasplit="test",
@@ -160,9 +168,10 @@ PRODUCTION_CONFIG = MetricsRunConfig(
         k=1000,                   # Deeper ranking analysis
         nbits=4,
         fused_ext=False,
-        num_threads=4,            # More threads for speed
+        num_threads=4,            # 4 threads optimal (M4 doesn't parallelize well)
         output_dir="/mnt/tmp/warp_measurements",
         buffer_flush_threshold=10_000,
+        query_chunk_size=500,     # Save progress every 500 queries (~2-3 min)
         collection="beir",
         dataset="quora",
         datasplit="test",
@@ -195,13 +204,14 @@ def print_config(config: MetricsRunConfig) -> None:
     print("=" * 70)
     
     print("\n[Raw Measurements]")
-    print(f"  num_queries:    {config.raw.num_queries}")
-    print(f"  nprobe:         {config.raw.nprobe}")
-    print(f"  k:              {config.raw.k}")
-    print(f"  nbits:          {config.raw.nbits}")
-    print(f"  num_threads:    {config.raw.num_threads}")
-    print(f"  output_dir:     {config.raw.output_dir}")
-    print(f"  dataset:        {config.raw.collection}/{config.raw.dataset}/{config.raw.datasplit}")
+    print(f"  num_queries:      {config.raw.num_queries}")
+    print(f"  nprobe:           {config.raw.nprobe}")
+    print(f"  k:                {config.raw.k}")
+    print(f"  nbits:            {config.raw.nbits}")
+    print(f"  num_threads:      {config.raw.num_threads}")
+    print(f"  query_chunk_size: {config.raw.query_chunk_size}  (crash resilience)")
+    print(f"  output_dir:       {config.raw.output_dir}")
+    print(f"  dataset:          {config.raw.collection}/{config.raw.dataset}/{config.raw.datasplit}")
     
     print("\n[Offline Metrics]")
     print(f"  a5_sample_fraction: {config.offline.a5_sample_fraction}")

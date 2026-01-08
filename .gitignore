@@ -22,3 +22,7 @@ __pycache__/
 .vscode
 *.tsv
 .env
+
+# Virtual environments and AI tooling
+.venv/
+.github/prompts/

@@ -295,6 +295,16 @@ class MetricsLoader:
         path = self.tier_b_dir / "M4_oracle_winners.parquet"
         return ChunkedParquetReader(path, chunk_size=self.chunk_size, verbose=self.verbose)
     
+    def get_m5_reader(self) -> ChunkedParquetReader:
+        """
+        Get chunked reader for M5 (routing misses) - very large file.
+        
+        Schema: (query_id, q_token_id, doc_id, oracle_embedding_pos, oracle_score,
+                 oracle_centroid_id, is_miss, observed_embedding_pos, observed_score, score_delta)
+        """
+        path = self.tier_b_dir / "M5_routing_misses.parquet"
+        return ChunkedParquetReader(path, chunk_size=self.chunk_size, verbose=self.verbose)
+    
     # =========================================================================
     # Derived Metrics (M2, M5, M6)
     # =========================================================================

@@ -58,6 +58,9 @@ from functools import partial
 import numpy as np
 import pandas as pd
 import torch
+from tqdm import tqdm
+
+from warp.utils.chunked_m4 import ChunkedM4Processor, DEFAULT_CHUNK_SIZE
 
 
 # =============================================================================
@@ -76,6 +79,9 @@ class OnlineMetricsConfig:
     # Parallelization (Phase 4, 5)
     num_workers: int = 8               # Workers for heavy metrics
     chunk_size: int = 100              # Queries per parallel chunk
+    
+    # Chunked M4 processing (for large runs)
+    m4_chunk_size: int = DEFAULT_CHUNK_SIZE  # Queries per M4 chunk (default: 500)
     
     # Recall@k values (C3 - renamed to "oracle_evidence_recall")
     recall_k_values: List[int] = field(default_factory=lambda: [10, 100, 1000])
@@ -352,14 +358,42 @@ class OnlineClusterPropertiesComputer:
     
     @property
     def m4(self) -> pd.DataFrame:
-        """Load M4 (oracle winners) lazily."""
+        """
+        Load M4 (oracle winners) lazily.
+        
+        WARNING: For large M4 files (>1GB), this will cause OOM errors.
+        Use the chunked processing methods instead:
+        - _compute_oracle_evidence_recall_chunked()
+        - _compute_evidence_dispersion_chunked()
+        """
         if self._m4 is None:
             path = self.tier_b_dir / "M4_oracle_winners.parquet"
             if not path.exists():
                 raise FileNotFoundError(f"M4 not found: {path}")
+            
+            # Check file size and warn if large
+            size_mb = path.stat().st_size / (1024 * 1024)
+            if size_mb > 1000:
+                warnings.warn(
+                    f"M4 file is {size_mb:.0f} MB. Loading into memory may cause OOM. "
+                    "Consider using chunked processing methods instead."
+                )
+            
             self._m4 = pd.read_parquet(path)
             self._log(f"  Loaded M4: {len(self._m4):,} rows")
         return self._m4
+    
+    def _get_m4_path(self) -> Path:
+        """Get path to M4 file."""
+        return self.tier_b_dir / "M4_oracle_winners.parquet"
+    
+    def _should_use_chunked_m4(self) -> bool:
+        """Check if M4 file is large enough to warrant chunked processing."""
+        m4_path = self._get_m4_path()
+        if not m4_path.exists():
+            return False
+        size_mb = m4_path.stat().st_size / (1024 * 1024)
+        return size_mb > 1000  # > 1GB
     
     @property
     def r0(self) -> pd.DataFrame:
@@ -658,7 +692,7 @@ class OnlineClusterPropertiesComputer:
     # Phase 4: Oracle-Based Metrics (M4) - Heavy, Parallelized
     # =========================================================================
     
-    def compute_phase4_oracle_metrics(self, parallel: bool = True) -> Dict[str, Any]:
+    def compute_phase4_oracle_metrics(self, parallel: bool = True, use_chunked: bool = True) -> Dict[str, Any]:
         """
         Compute Phase 4 metrics: C3/C5 (oracle evidence recall), C6 (evidence dispersion).
         
@@ -666,10 +700,11 @@ class OnlineClusterPropertiesComputer:
         appears in the actual top-k ranking? (Renamed from "pruning recall")
         
         These operate on M4 data which is large (~96K rows per query).
-        Parallelization is recommended for large runs.
+        For large M4 files (>1GB), uses chunked processing to avoid OOM.
         
         Args:
             parallel: Whether to parallelize across queries
+            use_chunked: Whether to use chunked processing for large M4 files
             
         Returns:
             Dictionary with:
@@ -679,11 +714,26 @@ class OnlineClusterPropertiesComputer:
         self._log("\n=== Phase 4: Oracle Metrics (M4) ===")
         start = time.time()
         
-        # C3/C5: Oracle evidence recall (renamed from pruning recall)
-        recall_df = self._compute_oracle_evidence_recall()
+        # Check if we should use chunked processing
+        should_chunk = use_chunked and self._should_use_chunked_m4()
         
-        # C6: Evidence dispersion (can be large, compute summary only)
-        dispersion_summary = self._compute_evidence_dispersion_summary()
+        if should_chunk:
+            m4_path = self._get_m4_path()
+            size_mb = m4_path.stat().st_size / (1024 * 1024)
+            self._log(f"  M4 file is {size_mb:.0f} MB - using chunked processing")
+            
+            # C3/C5: Oracle evidence recall (chunked)
+            recall_df = self._compute_oracle_evidence_recall_chunked()
+            
+            # C6: Evidence dispersion (chunked)
+            dispersion_summary = self._compute_evidence_dispersion_chunked()
+        else:
+            # Original non-chunked path
+            # C3/C5: Oracle evidence recall (renamed from pruning recall)
+            recall_df = self._compute_oracle_evidence_recall(parallel=parallel)
+            
+            # C6: Evidence dispersion (can be large, compute summary only)
+            dispersion_summary = self._compute_evidence_dispersion_summary()
         
         self._log(f"  Phase 4 completed in {time.time() - start:.1f}s")
         
@@ -781,6 +831,146 @@ class OnlineClusterPropertiesComputer:
             'max_unique_centroids': unique_centroids_per_doc.max(),
             'docs_with_1_centroid': (unique_centroids_per_doc == 1).sum(),
             'docs_with_multi_centroid': (unique_centroids_per_doc > 1).sum(),
+        }
+    
+    def _compute_oracle_evidence_recall_chunked(self) -> pd.DataFrame:
+        """
+        Compute C3/C5: Oracle evidence recall using chunked M4 processing.
+        
+        Processes M4 in query batches to avoid OOM errors for large files.
+        """
+        self._log("  Computing C3/C5: Oracle evidence recall (chunked)...")
+        
+        k_values = self.config.recall_k_values
+        m4_path = self._get_m4_path()
+        
+        # Load M3 once (should be smaller than M4)
+        m3_path = self.tier_b_dir / "M3_observed_winners.parquet"
+        m3 = pd.read_parquet(m3_path)
+        self._log(f"    Loaded M3: {len(m3):,} rows")
+        
+        # Compute actual document scores from M3 (this is fixed, doesn't depend on M4 chunks)
+        actual_scores = m3.groupby(['query_id', 'doc_id'])['winner_score'].sum().reset_index()
+        actual_scores.columns = ['query_id', 'doc_id', 'actual_score']
+        
+        # Create chunked processor
+        processor = ChunkedM4Processor(
+            m4_path,
+            chunk_size=self.config.m4_chunk_size,
+            verbose=self.verbose
+        )
+        
+        info = processor.get_file_info()
+        self._log(f"    Processing {info['num_queries']:,} queries in {info['num_chunks']} chunks")
+        
+        # Accumulate oracle scores per (query, doc) across chunks
+        oracle_scores_accumulated = {}  # (query_id, doc_id) -> total_oracle_score
+        
+        for m4_chunk in processor.iter_chunks(
+            columns=['query_id', 'doc_id', 'oracle_score'],
+            show_progress=self.verbose
+        ):
+            # Aggregate chunk
+            chunk_scores = m4_chunk.groupby(['query_id', 'doc_id'])['oracle_score'].sum()
+            
+            # Accumulate into global dict
+            for idx, score in chunk_scores.items():
+                key = idx  # idx is (query_id, doc_id) tuple
+                if key in oracle_scores_accumulated:
+                    oracle_scores_accumulated[key] += score
+                else:
+                    oracle_scores_accumulated[key] = score
+        
+        # Convert accumulated scores to DataFrame
+        oracle_scores = pd.DataFrame([
+            {'query_id': k[0], 'doc_id': k[1], 'oracle_score': v}
+            for k, v in oracle_scores_accumulated.items()
+        ])
+        
+        self._log(f"    Accumulated oracle scores for {len(oracle_scores):,} (query, doc) pairs")
+        
+        # Now compute recall per query
+        query_ids = actual_scores['query_id'].unique()
+        
+        actual_by_query = {qid: actual_scores[actual_scores['query_id'] == qid] 
+                          for qid in query_ids}
+        oracle_by_query = {qid: oracle_scores[oracle_scores['query_id'] == qid] 
+                          for qid in query_ids}
+        
+        results = []
+        for qid in tqdm(query_ids, desc="Computing recall@k", disable=not self.verbose):
+            if qid in oracle_by_query:
+                row = _compute_pruning_recall_single_query(
+                    qid, actual_by_query[qid], oracle_by_query[qid], k_values
+                )
+                results.append(row)
+        
+        df = pd.DataFrame(results)
+        
+        for k in k_values:
+            col = f'recall@{k}'
+            if col in df.columns:
+                self._log(f"    {col}: mean={df[col].mean():.3f}")
+        
+        return df
+    
+    def _compute_evidence_dispersion_chunked(self) -> Dict[str, float]:
+        """
+        Compute C6: Evidence dispersion using chunked M4 processing.
+        
+        Memory-optimized approach: Since each chunk contains complete queries
+        (ChunkedM4Processor partitions by query_id), all rows for any (query_id, doc_id)
+        pair are fully contained within a single chunk. This means we can compute
+        unique centroid counts directly within each chunk using nunique(), without
+        accumulating sets across chunks.
+        
+        Memory usage: O(total_pairs) integers (~750 MB) instead of O(total_pairs * avg_centroids) 
+        in sets (~70 GB).
+        """
+        self._log("  Computing C6: Evidence dispersion (chunked, memory-optimized)...")
+        
+        m4_path = self._get_m4_path()
+        
+        # Create chunked processor
+        processor = ChunkedM4Processor(
+            m4_path,
+            chunk_size=self.config.m4_chunk_size,
+            verbose=self.verbose
+        )
+        
+        # Collect unique centroid counts per (query, doc) - just integers, not sets
+        # Since chunks contain complete queries, we can compute nunique() within each chunk
+        all_unique_counts = []
+        
+        for m4_chunk in processor.iter_chunks(
+            columns=['query_id', 'doc_id', 'oracle_embedding_pos'],
+            show_progress=self.verbose
+        ):
+            # Compute centroid IDs for this chunk
+            oracle_positions = torch.tensor(m4_chunk['oracle_embedding_pos'].values, dtype=torch.long)
+            oracle_centroids = embedding_pos_to_centroid(oracle_positions, self.offsets).numpy()
+            
+            m4_chunk = m4_chunk.copy()
+            m4_chunk['oracle_centroid_id'] = oracle_centroids
+            
+            # Compute unique centroid count per (query, doc) WITHIN this chunk
+            # This works because all rows for a (query, doc) pair are in the same chunk
+            chunk_unique_counts = m4_chunk.groupby(['query_id', 'doc_id'])['oracle_centroid_id'].nunique()
+            all_unique_counts.extend(chunk_unique_counts.values)
+            
+            # Free memory
+            del m4_chunk, oracle_positions, oracle_centroids, chunk_unique_counts
+        
+        # Convert to numpy array for efficient statistics
+        unique_counts = np.array(all_unique_counts, dtype=np.int32)
+        self._log(f"    Computed dispersion for {len(unique_counts):,} (query, doc) pairs")
+        
+        return {
+            'mean_unique_centroids': float(unique_counts.mean()),
+            'median_unique_centroids': float(np.median(unique_counts)),
+            'max_unique_centroids': int(unique_counts.max()),
+            'docs_with_1_centroid': int((unique_counts == 1).sum()),
+            'docs_with_multi_centroid': int((unique_counts > 1).sum()),
         }
     
     # =========================================================================

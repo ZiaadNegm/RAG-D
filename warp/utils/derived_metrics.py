@@ -33,13 +33,16 @@ See docs/M2_M5_M6_INTEGRATION_PLAN.md for detailed specification.
 """
 
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 import warnings
 
 import pandas as pd
 import torch
 import pyarrow as pa
 import pyarrow.parquet as pq
+from tqdm import tqdm
+
+from warp.utils.chunked_m4 import ChunkedM4Processor, merge_partitioned_parquet, DEFAULT_CHUNK_SIZE
 
 
 class DerivedMetricsComputer:
@@ -60,7 +63,8 @@ class DerivedMetricsComputer:
         self,
         run_dir: str,
         index_path: Optional[str] = None,
-        chunk_size: int = 1_000_000
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        verbose: bool = True
     ):
         """
         Initialize the derived metrics computer.
@@ -69,11 +73,13 @@ class DerivedMetricsComputer:
             run_dir: Path to measurement run directory (contains tier_a/, tier_b/)
             index_path: Path to WARP index (needed for M5 centroid lookup).
                        Can be auto-detected from metadata.json if not provided.
-            chunk_size: Number of rows to process at once for large files.
-                       Currently unused but reserved for future MS MARCO scale.
+            chunk_size: Number of queries to process per chunk for M4.
+                       Default 500 queries. Set higher if more RAM is available.
+            verbose: Whether to print progress messages.
         """
         self.run_dir = Path(run_dir)
         self.chunk_size = chunk_size
+        self.verbose = verbose
         
         # Paths
         self.tier_a_dir = self.run_dir / "tier_a"
@@ -225,7 +231,8 @@ class DerivedMetricsComputer:
         self,
         save: bool = True,
         include_m3_join: bool = True,
-        top_k_only: bool = False
+        top_k_only: bool = False,
+        use_chunked: bool = True
     ) -> pd.DataFrame:
         """
         Compute M5: Routing misses.
@@ -241,6 +248,8 @@ class DerivedMetricsComputer:
             top_k_only: If True, only compute misses for docs that appear in M3
                        (top-k). This produces results comparable to the miss
                        rate reported in M4 E2E tests.
+            use_chunked: If True, process M4 in chunks to avoid OOM errors.
+                        Recommended for large runs (10K+ queries).
         
         Returns:
             DataFrame with columns:
@@ -255,6 +264,36 @@ class DerivedMetricsComputer:
         """
         self._check_source_files(["M4", "R0"])
         
+        m4_path = self.tier_b_dir / "M4_oracle_winners.parquet"
+        
+        # Check if M4 is large enough to warrant chunked processing
+        m4_size_mb = m4_path.stat().st_size / (1024 * 1024)
+        
+        if use_chunked and m4_size_mb > 1000:  # > 1GB triggers chunked processing
+            if self.verbose:
+                print(f"M4 file is {m4_size_mb:.0f} MB - using chunked processing (chunk_size={self.chunk_size})")
+            return self._compute_m5_chunked(
+                save=save,
+                include_m3_join=include_m3_join,
+                top_k_only=top_k_only
+            )
+        else:
+            # Small file - use original single-load approach
+            return self._compute_m5_single(
+                save=save,
+                include_m3_join=include_m3_join,
+                top_k_only=top_k_only
+            )
+    
+    def _compute_m5_single(
+        self,
+        save: bool = True,
+        include_m3_join: bool = True,
+        top_k_only: bool = False
+    ) -> pd.DataFrame:
+        """
+        Original single-load M5 computation (for small M4 files).
+        """
         # Load M4 (oracle winners)
         m4 = pd.read_parquet(self.tier_b_dir / "M4_oracle_winners.parquet")
         
@@ -270,19 +309,167 @@ class DerivedMetricsComputer:
             m4 = m4[m4.apply(lambda r: (r["query_id"], r["q_token_id"], r["doc_id"]) in top_k_docs, axis=1)]
             print(f"Filtered M4 to {len(m4):,} rows (top-k docs only)")
         
+        # Process the data
+        result = self._process_m5_chunk(m4, r0, include_m3_join)
+        
+        if save:
+            output_path = self.tier_b_dir / "M5_routing_misses.parquet"
+            result.to_parquet(output_path, index=False)
+            if self.verbose:
+                print(f"Saved M5 to {output_path}")
+        
+        return result
+    
+    def _compute_m5_chunked(
+        self,
+        save: bool = True,
+        include_m3_join: bool = True,
+        top_k_only: bool = False
+    ) -> pd.DataFrame:
+        """
+        Chunked M5 computation for large M4 files.
+        
+        Processes M4 in query batches and writes partitioned output files,
+        then merges them at the end.
+        """
+        m4_path = self.tier_b_dir / "M4_oracle_winners.parquet"
+        
+        # Create partition output directory
+        partition_dir = self.tier_b_dir / "M5_partitions"
+        partition_dir.mkdir(exist_ok=True)
+        
+        # Load R0 once (small file, fits in memory)
+        r0 = pd.read_parquet(self.tier_b_dir / "R0_selected_centroids.parquet")
+        if self.verbose:
+            print(f"Loaded R0: {len(r0):,} rows")
+        
+        # Load M3 once if needed for join
+        m3_lookup = None
+        if include_m3_join:
+            self._check_source_files(["M3"])
+            m3 = pd.read_parquet(self.tier_b_dir / "M3_observed_winners.parquet")
+            m3_lookup = m3[["query_id", "q_token_id", "doc_id", "winner_embedding_pos", "winner_score"]]
+            if self.verbose:
+                print(f"Loaded M3: {len(m3):,} rows")
+        
+        # Load top-k doc set if filtering
+        top_k_docs = None
+        if top_k_only:
+            self._check_source_files(["M3"])
+            if m3_lookup is None:
+                m3 = pd.read_parquet(self.tier_b_dir / "M3_observed_winners.parquet")
+            else:
+                m3 = m3_lookup
+            top_k_docs = set(zip(m3["query_id"], m3["q_token_id"], m3["doc_id"]))
+        
+        # Initialize chunked processor
+        processor = ChunkedM4Processor(
+            m4_path,
+            chunk_size=self.chunk_size,
+            verbose=self.verbose
+        )
+        
+        if self.verbose:
+            info = processor.get_file_info()
+            mem_est = processor.estimate_chunk_memory()
+            print(f"Processing {info['num_queries']:,} queries in {info['num_chunks']} chunks")
+            print(f"Estimated memory per chunk: {mem_est['estimated_chunk_memory_gb']:.1f} GB")
+        
+        # Process chunks and write partitioned output
+        partition_idx = 0
+        total_rows = 0
+        total_misses = 0
+        
+        for chunk_qids, m4_chunk in processor.iter_chunks_with_ids(show_progress=self.verbose):
+            # Filter to top-k if requested
+            if top_k_only and top_k_docs:
+                m4_chunk = m4_chunk[
+                    m4_chunk.apply(
+                        lambda r: (r["query_id"], r["q_token_id"], r["doc_id"]) in top_k_docs,
+                        axis=1
+                    )
+                ]
+            
+            if len(m4_chunk) == 0:
+                continue
+            
+            # Filter R0 to only this chunk's queries for efficiency
+            r0_chunk = r0[r0["query_id"].isin(chunk_qids)]
+            
+            # Filter M3 lookup if needed
+            m3_chunk = None
+            if m3_lookup is not None:
+                m3_chunk = m3_lookup[m3_lookup["query_id"].isin(chunk_qids)]
+            
+            # Process chunk
+            chunk_result = self._process_m5_chunk(m4_chunk, r0_chunk, include_m3_join, m3_chunk)
+            
+            # Write partition
+            partition_path = partition_dir / f"partition_{partition_idx:04d}.parquet"
+            chunk_result.to_parquet(partition_path, index=False)
+            
+            total_rows += len(chunk_result)
+            total_misses += chunk_result["is_miss"].sum()
+            partition_idx += 1
+        
+        if self.verbose:
+            print(f"\nWritten {partition_idx} partitions, {total_rows:,} total rows")
+            print(f"Total misses: {total_misses:,} ({total_misses/max(total_rows,1):.2%})")
+        
+        # Merge partitions into final output
+        output_path = self.tier_b_dir / "M5_routing_misses.parquet"
+        
+        if save:
+            if self.verbose:
+                print("Merging partitions...")
+            merge_partitioned_parquet(
+                partition_dir=partition_dir,
+                output_path=output_path,
+                delete_partitions=True,
+                verbose=self.verbose
+            )
+            # Clean up partition directory
+            partition_dir.rmdir()
+        
+        # Return merged result (or read back from disk if large)
+        if save and output_path.exists():
+            # For very large outputs, don't load into memory
+            output_size_mb = output_path.stat().st_size / (1024 * 1024)
+            if output_size_mb > 5000:  # > 5GB
+                if self.verbose:
+                    print(f"M5 output is {output_size_mb:.0f} MB - returning None to avoid OOM")
+                    print(f"Load with: pd.read_parquet('{output_path}')")
+                return None
+            return pd.read_parquet(output_path)
+        else:
+            # Read all partitions and return concatenated
+            partition_files = sorted(partition_dir.glob("partition_*.parquet"))
+            return pd.concat([pd.read_parquet(pf) for pf in partition_files], ignore_index=True)
+    
+    def _process_m5_chunk(
+        self,
+        m4_chunk: pd.DataFrame,
+        r0_chunk: pd.DataFrame,
+        include_m3_join: bool,
+        m3_chunk: Optional[pd.DataFrame] = None
+    ) -> pd.DataFrame:
+        """
+        Process a single chunk of M4 data to compute M5.
+        
+        This is the core computation shared by single and chunked processing.
+        """
         # Step 1: Compute oracle_centroid_id via vectorized binary search
-        # This is the key operation: map embedding_pos → centroid_id
-        oracle_positions = torch.tensor(m4["oracle_embedding_pos"].values, dtype=torch.long)
+        oracle_positions = torch.tensor(m4_chunk["oracle_embedding_pos"].values, dtype=torch.long)
         oracle_centroids = torch.searchsorted(
             self.offsets_compacted, oracle_positions, side="right"
         ) - 1
-        m4["oracle_centroid_id"] = oracle_centroids.numpy().astype("int32")
+        m4_chunk = m4_chunk.copy()
+        m4_chunk["oracle_centroid_id"] = oracle_centroids.numpy().astype("int32")
         
         # Step 2: Build selected centroid sets per (query, token)
-        r0_sets = r0.groupby(["query_id", "q_token_id"])["centroid_id"].apply(set).to_dict()
+        r0_sets = r0_chunk.groupby(["query_id", "q_token_id"])["centroid_id"].apply(set).to_dict()
         
         # Step 3: Compute is_miss for each M4 row
-        # Vectorized implementation for better performance
         def compute_is_miss_vectorized(df: pd.DataFrame, r0_sets: dict) -> pd.Series:
             """Check if oracle centroid is in selected centroids for each row."""
             is_miss = []
@@ -291,26 +478,27 @@ class DerivedMetricsComputer:
                 is_miss.append(oc not in selected)
             return pd.Series(is_miss, index=df.index)
         
-        m4["is_miss"] = compute_is_miss_vectorized(m4, r0_sets)
+        m4_chunk["is_miss"] = compute_is_miss_vectorized(m4_chunk, r0_sets)
         
         # Step 4: Optionally join with M3 for score_delta
         if include_m3_join:
-            self._check_source_files(["M3"])
-            m3 = pd.read_parquet(self.tier_b_dir / "M3_observed_winners.parquet")
+            if m3_chunk is None:
+                # Load M3 if not provided (fallback for single mode)
+                m3_chunk = pd.read_parquet(self.tier_b_dir / "M3_observed_winners.parquet")
+                m3_chunk = m3_chunk[["query_id", "q_token_id", "doc_id", "winner_embedding_pos", "winner_score"]]
             
-            m4 = m4.merge(
-                m3[["query_id", "q_token_id", "doc_id", "winner_embedding_pos", "winner_score"]],
+            m4_chunk = m4_chunk.merge(
+                m3_chunk,
                 on=["query_id", "q_token_id", "doc_id"],
                 how="left"
             )
-            m4.rename(columns={
+            m4_chunk.rename(columns={
                 "winner_embedding_pos": "observed_embedding_pos",
                 "winner_score": "observed_score"
             }, inplace=True)
             
             # score_delta = oracle - observed (positive means oracle was better)
-            # For docs not in top-k, observed_score is NaN, use oracle_score
-            m4["score_delta"] = m4["oracle_score"] - m4["observed_score"].fillna(m4["oracle_score"])
+            m4_chunk["score_delta"] = m4_chunk["oracle_score"] - m4_chunk["observed_score"].fillna(m4_chunk["oracle_score"])
         
         # Select output columns
         output_cols = [
@@ -320,19 +508,13 @@ class DerivedMetricsComputer:
         if include_m3_join:
             output_cols.extend(["observed_embedding_pos", "observed_score", "score_delta"])
         
-        result = m4[output_cols].copy()
-        
-        if save:
-            output_path = self.tier_b_dir / "M5_routing_misses.parquet"
-            result.to_parquet(output_path, index=False)
-            print(f"Saved M5 to {output_path}")
-        
-        return result
+        return m4_chunk[output_cols].copy()
     
     def compute_m6(
         self,
         m5_df: Optional[pd.DataFrame] = None,
-        save: bool = True
+        save: bool = True,
+        use_chunked: bool = True
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
         Compute M6: Missed centroid aggregation.
@@ -344,6 +526,7 @@ class DerivedMetricsComputer:
             m5_df: Pre-computed M5 DataFrame. If not provided, will load from
                   M5_routing_misses.parquet or compute fresh.
             save: Whether to save results to Parquet files
+            use_chunked: If True and M5 file is large, process in chunks.
         
         Returns:
             Tuple of (m6_global, m6_per_query):
@@ -358,13 +541,39 @@ class DerivedMetricsComputer:
             - query_id, oracle_centroid_id: Identifiers
             - miss_count, oracle_win_count, miss_rate: Per-query stats
         """
+        m5_path = self.tier_b_dir / "M5_routing_misses.parquet"
+        
         if m5_df is None:
-            m5_path = self.tier_b_dir / "M5_routing_misses.parquet"
             if m5_path.exists():
-                m5_df = pd.read_parquet(m5_path)
+                # Check M5 file size
+                m5_size_mb = m5_path.stat().st_size / (1024 * 1024)
+                
+                if use_chunked and m5_size_mb > 5000:  # > 5GB triggers chunked processing
+                    if self.verbose:
+                        print(f"M5 file is {m5_size_mb:.0f} MB - using chunked M6 computation")
+                    return self._compute_m6_chunked(save=save)
+                else:
+                    m5_df = pd.read_parquet(m5_path)
             else:
                 m5_df = self.compute_m5(save=False)
         
+        # Handle None return from chunked M5 processing
+        if m5_df is None:
+            if m5_path.exists():
+                return self._compute_m6_chunked(save=save)
+            else:
+                raise ValueError("M5 data not available and could not be computed")
+        
+        return self._compute_m6_from_df(m5_df, save=save)
+    
+    def _compute_m6_from_df(
+        self,
+        m5_df: pd.DataFrame,
+        save: bool = True
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Compute M6 from an in-memory M5 DataFrame.
+        """
         # M6 Tier A: Global aggregation by centroid
         m6_global = m5_df.groupby("oracle_centroid_id").agg(
             miss_count=("is_miss", "sum"),
@@ -375,8 +584,8 @@ class DerivedMetricsComputer:
         # Type conversion for clean storage
         m6_global = m6_global.astype({
             "oracle_centroid_id": "int32",
-            "miss_count": "int32",
-            "oracle_win_count": "int32",
+            "miss_count": "int64",
+            "oracle_win_count": "int64",
             "miss_rate": "float32"
         })
         
@@ -390,8 +599,8 @@ class DerivedMetricsComputer:
         # Type conversion
         m6_per_query["query_id"] = m6_per_query["query_id"].astype("int32")
         m6_per_query["oracle_centroid_id"] = m6_per_query["oracle_centroid_id"].astype("int32")
-        m6_per_query["miss_count"] = m6_per_query["miss_count"].astype("int32")
-        m6_per_query["oracle_win_count"] = m6_per_query["oracle_win_count"].astype("int32")
+        m6_per_query["miss_count"] = m6_per_query["miss_count"].astype("int64")
+        m6_per_query["oracle_win_count"] = m6_per_query["oracle_win_count"].astype("int64")
         m6_per_query["miss_rate"] = m6_per_query["miss_rate"].astype("float32")
         
         if save:
@@ -401,8 +610,127 @@ class DerivedMetricsComputer:
             m6_global.to_parquet(global_path, index=False)
             m6_per_query.to_parquet(per_query_path, index=False)
             
-            print(f"Saved M6 global to {global_path}")
-            print(f"Saved M6 per-query to {per_query_path}")
+            if self.verbose:
+                print(f"Saved M6 global to {global_path}")
+                print(f"Saved M6 per-query to {per_query_path}")
+        
+        return m6_global, m6_per_query
+    
+    def _compute_m6_chunked(self, save: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Compute M6 from a large M5 file using chunked processing.
+        
+        Accumulates aggregates across chunks and combines at the end.
+        """
+        m5_path = self.tier_b_dir / "M5_routing_misses.parquet"
+        
+        if self.verbose:
+            print("Computing M6 with chunked M5 processing...")
+        
+        # Get unique query IDs for chunking
+        query_ids = pd.read_parquet(m5_path, columns=['query_id'])['query_id'].unique()
+        query_ids = sorted(query_ids.tolist())
+        
+        # Accumulators for global aggregation
+        global_accumulator = {}  # centroid_id -> (miss_count, oracle_win_count)
+        
+        # Per-query results (write directly to partitioned output)
+        per_query_partition_dir = self.tier_b_dir / "M6_per_query_partitions"
+        per_query_partition_dir.mkdir(exist_ok=True)
+        
+        # Process in chunks
+        num_chunks = (len(query_ids) + self.chunk_size - 1) // self.chunk_size
+        
+        for chunk_idx in tqdm(range(num_chunks), desc="Processing M6 chunks", disable=not self.verbose):
+            start_idx = chunk_idx * self.chunk_size
+            end_idx = min(start_idx + self.chunk_size, len(query_ids))
+            chunk_qids = query_ids[start_idx:end_idx]
+            
+            # Load M5 chunk using predicate pushdown
+            m5_chunk = pd.read_parquet(
+                m5_path,
+                columns=['query_id', 'oracle_centroid_id', 'is_miss'],
+                filters=[('query_id', 'in', chunk_qids)]
+            )
+            
+            # Global aggregation (accumulate)
+            chunk_global = m5_chunk.groupby('oracle_centroid_id').agg(
+                miss_count=('is_miss', 'sum'),
+                oracle_win_count=('is_miss', 'count')
+            )
+            
+            for centroid_id, row in chunk_global.iterrows():
+                if centroid_id in global_accumulator:
+                    prev_miss, prev_total = global_accumulator[centroid_id]
+                    global_accumulator[centroid_id] = (
+                        prev_miss + row['miss_count'],
+                        prev_total + row['oracle_win_count']
+                    )
+                else:
+                    global_accumulator[centroid_id] = (row['miss_count'], row['oracle_win_count'])
+            
+            # Per-query aggregation (write partition)
+            chunk_per_query = m5_chunk.groupby(['query_id', 'oracle_centroid_id']).agg(
+                miss_count=('is_miss', 'sum'),
+                oracle_win_count=('is_miss', 'count')
+            ).reset_index()
+            chunk_per_query['miss_rate'] = chunk_per_query['miss_count'] / chunk_per_query['oracle_win_count']
+            
+            partition_path = per_query_partition_dir / f"partition_{chunk_idx:04d}.parquet"
+            chunk_per_query.to_parquet(partition_path, index=False)
+        
+        # Build global M6 from accumulator
+        m6_global = pd.DataFrame([
+            {
+                'oracle_centroid_id': cid,
+                'miss_count': counts[0],
+                'oracle_win_count': counts[1],
+                'miss_rate': counts[0] / counts[1] if counts[1] > 0 else 0.0
+            }
+            for cid, counts in global_accumulator.items()
+        ])
+        
+        m6_global = m6_global.astype({
+            'oracle_centroid_id': 'int32',
+            'miss_count': 'int64',
+            'oracle_win_count': 'int64',
+            'miss_rate': 'float32'
+        })
+        
+        # Merge per-query partitions
+        per_query_path = self.tier_b_dir / "M6_per_query.parquet"
+        
+        if save:
+            # Save global
+            global_path = self.tier_a_dir / "M6_missed_centroids_global.parquet"
+            m6_global.to_parquet(global_path, index=False)
+            if self.verbose:
+                print(f"Saved M6 global to {global_path}")
+            
+            # Merge per-query partitions
+            merge_partitioned_parquet(
+                partition_dir=per_query_partition_dir,
+                output_path=per_query_path,
+                delete_partitions=True,
+                verbose=self.verbose
+            )
+            # Directory already removed by merge_partitioned_parquet
+        
+        # Load merged per-query (or concatenate if not saved)
+        if save and per_query_path.exists():
+            m6_per_query = pd.read_parquet(per_query_path)
+        else:
+            partition_files = sorted(per_query_partition_dir.glob("partition_*.parquet"))
+            m6_per_query = pd.concat([pd.read_parquet(pf) for pf in partition_files], ignore_index=True)
+        
+        # Ensure correct types
+        m6_per_query = m6_per_query.astype({
+            'query_id': 'int32',
+            'oracle_centroid_id': 'int32',
+            'miss_count': 'int64',
+            'oracle_win_count': 'int64',
+            'miss_rate': 'float32'
+        })
         
         return m6_global, m6_per_query
     

@@ -88,16 +88,20 @@ def step_1_collect_raw_measurements(config, run_id: str) -> dict:
     queries.queries.data = dict(list(queries.queries.data.items())[:config.raw.num_queries])
     print(f"Queries: {len(queries)} / {original_count} (subset for this run)")
     
-    # Setup tracker
+    # Setup tracker with query chunking for crash resilience
     output_dir = config.get_run_output_dir()
     steps = ["Query Encoding", "Candidate Generation", "top-k Precompute", "Decompression", "Build Matrix"]
+    
+    # Get chunk size from config or use default (500 queries)
+    query_chunk_size = getattr(config.raw, 'query_chunk_size', 500)
     
     tracker = ExecutionTracker(
         name="WARP_Metrics",
         steps=steps,
         measurement_run_id=run_id,
         measurement_output_dir=output_dir,
-        index_path=config.index_path
+        index_path=config.index_path,
+        query_chunk_size=query_chunk_size
     )
     
     # Enable M3 and M4 tracking
@@ -105,6 +109,7 @@ def step_1_collect_raw_measurements(config, run_id: str) -> dict:
     tracker.enable_m4_tracking(True)
     print(f"\nM3 tracking enabled: {tracker._m3_tracking_enabled}")
     print(f"M4 tracking enabled: {tracker.m4_tracking_enabled}")
+    print(f"Query chunk size: {query_chunk_size} (saves progress every {query_chunk_size} queries)")
     
     # Run search
     print(f"\nRunning search on {len(queries)} queries...")
@@ -119,6 +124,10 @@ def step_1_collect_raw_measurements(config, run_id: str) -> dict:
     
     # Finalize measurements
     tracker.finalize_measurements()
+    
+    # Merge chunk files into final files
+    print("\nMerging chunk files...")
+    merged_files = tracker.merge_chunks(delete_chunks=True)
     
     elapsed = time.time() - start_time
     run_dir = f"{output_dir}/runs/{run_id}"
@@ -196,6 +205,9 @@ def step_2_compute_offline_metrics(config) -> dict:
 def step_3_compute_derived_metrics(config, run_dir: str) -> dict:
     """
     Step 3: Compute derived metrics (M2, M5, M6).
+    
+    For large M4 files (>1GB), automatically uses chunked processing
+    to avoid OOM errors.
     """
     from warp.utils.derived_metrics import DerivedMetricsComputer
     
@@ -205,9 +217,14 @@ def step_3_compute_derived_metrics(config, run_dir: str) -> dict:
     
     start_time = time.time()
     
+    # Get chunk size from config or use default (500 queries)
+    chunk_size = getattr(config.derived, 'm4_chunk_size', 500)
+    
     computer = DerivedMetricsComputer(
         run_dir=run_dir,
-        index_path=config.index_path
+        index_path=config.index_path,
+        chunk_size=chunk_size,
+        verbose=True
     )
     
     results = {}
@@ -265,6 +282,9 @@ def step_3_compute_derived_metrics(config, run_dir: str) -> dict:
 def step_4_compute_online_metrics(config, run_dir: str) -> dict:
     """
     Step 4: Compute online cluster properties (A4, A6, B1-B4, C1-C6).
+    
+    For large M4 files (>1GB), automatically uses chunked processing
+    for C3 and C6 metrics to avoid OOM errors.
     """
     from warp.utils.online_cluster_properties import (
         OnlineClusterPropertiesComputer,
@@ -277,12 +297,16 @@ def step_4_compute_online_metrics(config, run_dir: str) -> dict:
     
     start_time = time.time()
     
+    # Get M4 chunk size from config or use default (500 queries)
+    m4_chunk_size = getattr(config.online, 'm4_chunk_size', 500)
+    
     online_config = OnlineConfig(
         hub_percentile=config.online.hub_percentile,
         bad_yield_threshold=config.online.bad_yield_threshold,
         good_yield_threshold=config.online.good_yield_threshold,
         num_workers=config.online.num_workers,
         recall_k_values=config.online.recall_k_values,
+        m4_chunk_size=m4_chunk_size,
         # Streamlining flags
         skip_c4_routing_fidelity=getattr(config.online, 'skip_c4_routing_fidelity', True),
         skip_b2_entropy=getattr(config.online, 'skip_b2_entropy', True),
@@ -498,25 +522,41 @@ def run_diagnostics(run_dir: str) -> dict:
         print(f"\n[M3] NOT FOUND: {m3_path}")
         diagnostics["M3"] = {"error": "File not found"}
     
-    # Check M4
+    # Check M4 (lightweight - only load query_id column for large files)
     m4_path = run_path / "tier_b" / "M4_oracle_winners.parquet"
     if m4_path.exists():
-        m4 = pd.read_parquet(m4_path)
-        diagnostics["M4"] = {
-            "rows": len(m4),
-            "unique_queries": m4['query_id'].nunique(),
-            "unique_docs": m4['doc_id'].nunique(),
-            "size_mb": m4_path.stat().st_size / (1024 * 1024),
-        }
-        print(f"\n[M4] {len(m4):,} rows ({diagnostics['M4']['size_mb']:.1f} MB)")
-        print(f"  Unique queries: {diagnostics['M4']['unique_queries']}")
-        print(f"  Unique docs: {diagnostics['M4']['unique_docs']}")
-        
-        # M4 scope check
-        if diagnostics.get("M3"):
-            m3_docs = m3['doc_id'].nunique()
-            m4_docs = diagnostics['M4']['unique_docs']
-            print(f"  M4/M3 doc coverage: {m4_docs}/{m3_docs} = {m4_docs/m3_docs:.1%}")
+        size_mb = m4_path.stat().st_size / (1024 * 1024)
+        # For large files (>1GB), only load query_id column to avoid OOM
+        if size_mb > 1024:
+            import pyarrow.parquet as pq
+            m4_meta = pq.read_metadata(m4_path)
+            m4_qids = pd.read_parquet(m4_path, columns=['query_id'])
+            diagnostics["M4"] = {
+                "rows": m4_meta.num_rows,
+                "unique_queries": m4_qids['query_id'].nunique(),
+                "unique_docs": "N/A (large file)",
+                "size_mb": size_mb,
+            }
+            print(f"\n[M4] {m4_meta.num_rows:,} rows ({size_mb:.1f} MB)")
+            print(f"  Unique queries: {diagnostics['M4']['unique_queries']}")
+            print(f"  (Skipped full load - file too large)")
+        else:
+            m4 = pd.read_parquet(m4_path)
+            diagnostics["M4"] = {
+                "rows": len(m4),
+                "unique_queries": m4['query_id'].nunique(),
+                "unique_docs": m4['doc_id'].nunique(),
+                "size_mb": size_mb,
+            }
+            print(f"\n[M4] {len(m4):,} rows ({diagnostics['M4']['size_mb']:.1f} MB)")
+            print(f"  Unique queries: {diagnostics['M4']['unique_queries']}")
+            print(f"  Unique docs: {diagnostics['M4']['unique_docs']}")
+            
+            # M4 scope check
+            if diagnostics.get("M3"):
+                m3_docs = m3['doc_id'].nunique()
+                m4_docs = diagnostics['M4']['unique_docs']
+                print(f"  M4/M3 doc coverage: {m4_docs}/{m3_docs} = {m4_docs/m3_docs:.1%}")
     else:
         print(f"\n[M4] NOT FOUND: {m4_path}")
         diagnostics["M4"] = {"error": "File not found"}

@@ -249,8 +249,21 @@ class ParallelIndexScorerWARP(ParallelIndexLoaderWARP):
             extra_cflags=cflags,
             verbose=os.getenv("WARP_LOAD_TORCH_EXTENSION_VERBOSE", "False") == "True",
         )
+        # Original versions (baseline)
         cls.oracle_scorer_cpp[2] = oracle_scorer_module.compute_oracle_batch_2_cpp
         cls.oracle_scorer_cpp[4] = oracle_scorer_module.compute_oracle_batch_4_cpp
+        # Optimized versions (6-12x faster)
+        cls.oracle_scorer_cpp['optimized_2'] = oracle_scorer_module.compute_oracle_batch_optimized_2_cpp
+        cls.oracle_scorer_cpp['optimized_4'] = oracle_scorer_module.compute_oracle_batch_optimized_4_cpp
+        # Smart versions (M3-informed skip logic)
+        cls.oracle_scorer_cpp['smart_2'] = oracle_scorer_module.compute_oracle_batch_smart_2_cpp
+        cls.oracle_scorer_cpp['smart_4'] = oracle_scorer_module.compute_oracle_batch_smart_4_cpp
+        # WARP-style versions (10-20x faster, requires precomputed embedding_to_centroid)
+        cls.oracle_scorer_cpp['warp_2'] = oracle_scorer_module.compute_oracle_batch_warp_2_cpp
+        cls.oracle_scorer_cpp['warp_4'] = oracle_scorer_module.compute_oracle_batch_warp_4_cpp
+        # WARP-style with tracking (also returns centroid IDs)
+        cls.oracle_scorer_cpp['warp_tracking_2'] = oracle_scorer_module.compute_oracle_batch_warp_tracking_2_cpp
+        cls.oracle_scorer_cpp['warp_tracking_4'] = oracle_scorer_module.compute_oracle_batch_warp_tracking_4_cpp
 
         cls.loaded_extensions = True
 

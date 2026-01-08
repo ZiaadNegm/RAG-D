@@ -34,11 +34,12 @@ Test Plan:
 
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
+from tqdm import tqdm
 
 from hypothesis.configs import ensure_output_dirs
 from hypothesis.data import MetricsLoader
@@ -77,7 +78,7 @@ class H15_MissSeverity(HypothesisTest):
     CLAIM = "Clusters with high-similarity tokens have more severe misses when not selected"
     
     def setup(self):
-        """Extended setup: load M5 and aggregate by centroid."""
+        """Extended setup: load M5 and aggregate by centroid using chunked streaming."""
         ensure_output_dirs(self.config)
         
         # Load base tables
@@ -85,7 +86,7 @@ class H15_MissSeverity(HypothesisTest):
         self.cluster_frame = tables['cluster_frame']
         self.query_frame = tables.get('query_frame')
         
-        # Load M5 and aggregate by centroid
+        # Load M5 via chunked reader and aggregate by centroid
         self.loader = MetricsLoader(
             index_path=self.config.paths.index_path,
             run_dir=self.config.paths.run_dir,
@@ -94,50 +95,134 @@ class H15_MissSeverity(HypothesisTest):
         )
         
         try:
-            m5 = self.loader.load_m5()
-            
-            # Filter to actual misses
-            m5_misses = m5[m5['is_miss'] == True] if 'is_miss' in m5.columns else m5
-            
-            if len(m5_misses) == 0:
+            self.centroid_severity = self._aggregate_m5_chunked()
+            if len(self.centroid_severity) > 0:
+                print(f"Aggregated M5 severity for {len(self.centroid_severity)} centroids")
+            else:
                 print("Warning: No misses found in M5")
-                self.centroid_severity = pd.DataFrame()
-                return
-            
-            # Aggregate by oracle_centroid_id
-            self.centroid_severity = m5_misses.groupby('oracle_centroid_id').agg({
-                'score_delta': ['mean', 'max', 'std', 'count'],
-                'oracle_score': ['mean', 'max'] if 'oracle_score' in m5_misses.columns else [],
-            }).reset_index()
-            
-            # Flatten column names
-            self.centroid_severity.columns = [
-                '_'.join(col).strip('_') if isinstance(col, tuple) else col 
-                for col in self.centroid_severity.columns
-            ]
-            
-            # Rename for clarity
-            rename_map = {
-                'oracle_centroid_id': 'centroid_id',
-                'score_delta_mean': 'mean_score_delta',
-                'score_delta_max': 'max_score_delta',
-                'score_delta_std': 'score_delta_std',
-                'score_delta_count': 'miss_count_m5',
-                'oracle_score_mean': 'mean_oracle_score',
-                'oracle_score_max': 'max_oracle_score',
-            }
-            self.centroid_severity = self.centroid_severity.rename(columns=rename_map)
-            
-            print(f"Aggregated M5 severity for {len(self.centroid_severity)} centroids")
-            
+                
         except FileNotFoundError:
             print("Warning: M5 not available, using m6_miss_rate as severity proxy")
             self.centroid_severity = pd.DataFrame()
         except Exception as e:
             print(f"Warning: Could not load M5: {e}")
+            import traceback
+            traceback.print_exc()
             self.centroid_severity = pd.DataFrame()
         
         print(f"Loaded cluster_frame: {self.cluster_frame.shape}")
+    
+    def _aggregate_m5_chunked(self) -> pd.DataFrame:
+        """
+        Aggregate M5 by centroid using streaming chunks.
+        
+        Uses online aggregation to compute mean, max, std, count without
+        loading the entire file into memory.
+        """
+        m5_reader = self.loader.get_m5_reader()
+        
+        # Track running statistics per centroid using Welford's online algorithm
+        # For each centroid: count, mean, M2 (for variance), max
+        centroid_stats: Dict[int, Dict] = {}
+        
+        columns_to_read = ['oracle_centroid_id', 'is_miss', 'score_delta', 'oracle_score']
+        
+        total_misses = 0
+        total_rows = 0
+        n_chunks = m5_reader.num_chunks
+        
+        print(f"Processing M5: {m5_reader.num_queries} queries in {n_chunks} chunks...")
+        
+        # Use tqdm with chunk count and show running stats
+        pbar = tqdm(
+            m5_reader.iter_chunks(columns=columns_to_read),
+            total=n_chunks,
+            desc="Aggregating M5",
+            unit="chunk"
+        )
+        
+        for chunk in pbar:
+            total_rows += len(chunk)
+            
+            # Filter to actual misses
+            if 'is_miss' in chunk.columns:
+                chunk = chunk[chunk['is_miss'] == True]
+            
+            chunk_misses = len(chunk)
+            total_misses += chunk_misses
+            
+            # Update progress bar with stats
+            pbar.set_postfix({
+                'rows': f'{total_rows:,}',
+                'misses': f'{total_misses:,}',
+                'centroids': len(centroid_stats)
+            })
+            
+            if chunk_misses == 0:
+                continue
+            
+            # Update running stats for each centroid
+            for centroid_id, group in chunk.groupby('oracle_centroid_id'):
+                deltas = group['score_delta'].values
+                oracle_scores = group['oracle_score'].values if 'oracle_score' in group.columns else None
+                
+                if centroid_id not in centroid_stats:
+                    centroid_stats[centroid_id] = {
+                        'count': 0,
+                        'mean': 0.0,
+                        'M2': 0.0,  # For Welford's variance
+                        'max_delta': float('-inf'),
+                        'oracle_sum': 0.0,
+                        'oracle_max': float('-inf'),
+                        'oracle_count': 0,
+                    }
+                
+                stats = centroid_stats[centroid_id]
+                
+                # Update count, mean, M2 using Welford's online algorithm
+                for delta in deltas:
+                    stats['count'] += 1
+                    delta_from_mean = delta - stats['mean']
+                    stats['mean'] += delta_from_mean / stats['count']
+                    delta_from_new_mean = delta - stats['mean']
+                    stats['M2'] += delta_from_mean * delta_from_new_mean
+                    stats['max_delta'] = max(stats['max_delta'], delta)
+                
+                # Update oracle score stats
+                if oracle_scores is not None:
+                    for os in oracle_scores:
+                        if not np.isnan(os):
+                            stats['oracle_sum'] += os
+                            stats['oracle_count'] += 1
+                            stats['oracle_max'] = max(stats['oracle_max'], os)
+        
+        pbar.close()
+        print(f"Processed {total_rows:,} rows, {total_misses:,} misses across {len(centroid_stats)} centroids")
+        
+        if not centroid_stats:
+            return pd.DataFrame()
+        
+        # Convert to DataFrame
+        records = []
+        for centroid_id, stats in centroid_stats.items():
+            count = stats['count']
+            std = np.sqrt(stats['M2'] / count) if count > 1 else 0.0
+            
+            record = {
+                'centroid_id': centroid_id,
+                'mean_score_delta': stats['mean'],
+                'max_score_delta': stats['max_delta'],
+                'score_delta_std': std,
+                'miss_count_m5': count,
+            }
+            
+            if stats['oracle_count'] > 0:
+                record['mean_oracle_score'] = stats['oracle_sum'] / stats['oracle_count']
+                record['max_oracle_score'] = stats['oracle_max']
+            
+            records.append(record)
+        
+        return pd.DataFrame(records)
     
     def analyze(self) -> HypothesisResult:
         df = self.cluster_frame
