@@ -1,28 +1,44 @@
+# Experiment outputs and data
 /experiments/results/
 /checkpoints/
 /data/
 /logs/
 /mlruns/
 /profiler/
-/logs/
+/outputs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
 
 # Jupyter Notebook
 .ipynb_checkpoints
-# notebooks/
 
-# mac
+# macOS
 .DS_Store
 
-# Other
-.vscode
-*.tsv
-.env
+# IDE and editor
+.vscode/
+.idea/
 
-# Virtual environments and AI tooling
+# Environment files
+.env
+*.tsv
+
+# Virtual environments
 .venv/
+venv/
+env/
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Thesis files (not part of codebase)
+docs/Thesis/
+
+# GitHub prompts (internal)
 .github/prompts/

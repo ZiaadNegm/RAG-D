@@ -438,7 +438,7 @@ class H4_ConcentrationRedundancy(HypothesisTest):
             claim=self.CLAIM,
             supported=supported,
             effect_size=corr,
-            effect_size_ci=(0.0, 0.0),  # TODO: Bootstrap CI
+            effect_size_ci=(0.0, 0.0),  # Bootstrap CI not implemented
             p_value=pval,
             statistics={
                 'spearman_correlation': corr,

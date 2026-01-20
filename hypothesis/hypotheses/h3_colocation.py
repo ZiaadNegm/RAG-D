@@ -45,6 +45,7 @@ from tqdm import tqdm
 
 from hypothesis.hypotheses.template import HypothesisTest, HypothesisResult
 from hypothesis.configs import RuntimeConfig, load_config
+from hypothesis.stats import bootstrap_ci
 
 
 # =============================================================================
@@ -83,6 +84,11 @@ class FallbackAnalysisResult:
     r0_lookup_unique_keys: int = 0
     docs_checked: int = 0
     
+    # Bootstrap confidence intervals
+    no_fallback_ci_lower: Optional[float] = None
+    no_fallback_ci_upper: Optional[float] = None
+    n_bootstrap: int = 1000
+    
     # Per-case details (optional, for inspection)
     case_details: Optional[pd.DataFrame] = None
     
@@ -93,6 +99,12 @@ class FallbackAnalysisResult:
             'no_fallback_count': self.no_fallback_count,
             'has_fallback_pct': self.has_fallback_pct,
             'no_fallback_pct': self.no_fallback_pct,
+            'bootstrap_ci': {
+                'ci_lower': self.no_fallback_ci_lower,
+                'ci_upper': self.no_fallback_ci_upper,
+                'n_bootstrap': self.n_bootstrap,
+                'ci_level': 0.95,
+            },
             'sampling': {
                 'is_sampled': self.is_sampled,
                 'sample_size': self.sample_size,
@@ -735,6 +747,22 @@ class H3_Colocation(HypothesisTest):
         has_fallback_pct = (has_fallback_count / total_to_check) * 100
         no_fallback_pct = (no_fallback_count / total_to_check) * 100
         
+        # Bootstrap confidence interval for no_fallback_pct
+        # Create binary array: 1 = no fallback, 0 = has fallback
+        fallback_binary = np.array([0 if r['has_fallback'] else 1 for r in results])
+        
+        def pct_no_fallback(arr):
+            return np.mean(arr) * 100
+        
+        n_bootstrap = 1000
+        _, ci_lower, ci_upper = bootstrap_ci(
+            fallback_binary,
+            statistic=pct_no_fallback,
+            n_bootstrap=n_bootstrap,
+            ci_level=0.95,
+            random_state=RANDOM_SEED
+        )
+        
         # Print results
         print(f"\n" + "=" * 60)
         print("RESULTS: Fallback Availability")
@@ -751,6 +779,7 @@ class H3_Colocation(HypothesisTest):
         print(f"\n  NO fallback (zero accessible embeddings):")
         print(f"    Count: {no_fallback_count:,}")
         print(f"    Percentage: {no_fallback_pct:.2f}%")
+        print(f"    Bootstrap 95% CI: [{ci_lower:.2f}%, {ci_upper:.2f}%]")
         print(f"\n  Expected no-fallback %: {self.EXPECTED_NO_FALLBACK_PCT}%")
         
         if abs(no_fallback_pct - self.EXPECTED_NO_FALLBACK_PCT) < 1.0:
@@ -776,6 +805,9 @@ class H3_Colocation(HypothesisTest):
             m4r_inaccessible_count_matches=m4r_count_matches,
             r0_lookup_unique_keys=len(self.r0_lookup),
             docs_checked=inaccessible['doc_id'].nunique(),
+            no_fallback_ci_lower=ci_lower,
+            no_fallback_ci_upper=ci_upper,
+            n_bootstrap=n_bootstrap,
             case_details=case_details_df,
         )
         

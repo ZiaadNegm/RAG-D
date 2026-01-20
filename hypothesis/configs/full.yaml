@@ -1,0 +1,34 @@
+# Full Configuration - Complete Dataset Analysis (No Sampling)
+# Purpose: Exhaustive analysis of entire index, no sampling
+# Runtime target: may take longer, used for final validation
+
+name: full
+
+# Query scope: full dataset
+num_queries: null  # null = use all available queries
+query_sample_seed: 42
+
+# Paths
+paths:
+  index_path: /mnt/datasets/index/beir-quora.split=test.nbits=4
+  run_dir: /mnt/tmp/warp_measurements/production_beir_quora/runs/metrics_production_20260104_115425
+  output_root: /mnt/hypothesis_outputs/full
+
+# Processing: optimized for throughput
+processing:
+  m4_chunk_size: 1000      # Larger chunks for efficiency
+  max_memory_gb: 32.0      # Allow more memory usage
+  num_workers: 16          # Maximum parallelism
+  parallel_reads: true
+  cache_standardized_tables: true
+  cache_dir: /mnt/hypothesis_outputs/cache/full
+
+# Output  
+verbose: true
+progress_bars: true
+
+# Full analysis notes:
+# - 100% of clusters analyzed (no sampling)
+# - All vectors per cluster included (no cap)
+# - Used for final validation of smoke/dev/prod results
+# - May require significant memory and time

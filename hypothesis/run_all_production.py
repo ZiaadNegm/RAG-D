@@ -113,7 +113,7 @@ def main():
                 'timestamp': result.timestamp,
             }
             
-            status = '✅ SUPPORTED' if result.supported else '❌ NOT SUPPORTED'
+            status = 'SUPPORTED' if result.supported else 'NOT SUPPORTED'
             print(f"\nResult: {status}")
             print(f"Effect size: {result.effect_size:.4f}" if result.effect_size == result.effect_size else "Effect size: N/A")
             print(f"p-value: {result.p_value:.2e}" if result.p_value == result.p_value else "p-value: N/A")
@@ -141,7 +141,7 @@ def main():
         if 'error' in res:
             print(f"{h_id}: ERROR - {res['error'][:60]}")
         else:
-            status = '✅ SUPPORTED' if res['supported'] else '❌ NOT SUPPORTED'
+            status = 'SUPPORTED' if res['supported'] else 'NOT SUPPORTED'
             effect = res['effect_size']
             pval = res['p_value']
             n = res['n_observations']

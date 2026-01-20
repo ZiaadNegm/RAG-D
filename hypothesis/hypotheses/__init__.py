@@ -16,6 +16,7 @@ from hypothesis.hypotheses.template import (
 
 from hypothesis.hypotheses.h3_phase2_recall import H3_Phase2_Recall
 from hypothesis.hypotheses.h3_colocation import H3_Colocation, FallbackAnalysisResult
+from hypothesis.hypotheses.h_projection_spectrum import H_ProjectionSpectrum
 
 __all__ = [
     'HypothesisTest',
@@ -25,6 +26,7 @@ __all__ = [
     'H3_Phase2_Recall',
     'H3_Colocation',
     'FallbackAnalysisResult',
+    'H_ProjectionSpectrum',
     'run_hypothesis',
     'AVAILABLE_HYPOTHESES',
 ]

@@ -32,8 +32,7 @@ if __name__ == '__main__':
             root=".",
         )
         
-        print("\n[1/3] Loading searcher...")
-        searcher = Searcher(
+        print("\n[1/3] Loading searcher..
             index="msmarco_passage.nbits2",
             collection=collection_path,
             config=config

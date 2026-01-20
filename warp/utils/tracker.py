@@ -971,7 +971,7 @@ class ExecutionTracker:
         self._current_query_id: Optional[int] = None
         
         # Legacy in-memory metrics storage (for backward compatibility)
-        # TODO: Deprecate in favor of MeasurementCollector
+        # Note: MeasurementCollector is the preferred approach for new code
         self._legacy_metrics_current: Dict[str, Any] = {}
         self._legacy_metrics_all: List[Dict[str, Any]] = []
         self._legacy_lock = threading.Lock()
